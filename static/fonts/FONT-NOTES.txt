@@ -1,0 +1,30 @@
+Slothmore typography
+====================
+
+JetBrains Mono
+  The dashboard is set entirely in JetBrains Mono, the free developer typeface
+  by Philipp Nurullin / JetBrains. Hierarchy comes from weight, italic, size
+  and letter-spacing rather than mixing families:
+
+    ExtraBold (800), slight negative tracking  — page title, brand
+    Bold (700), slight negative tracking       — section headings, README headings
+    SemiBold (600)                             — card titles, selected nav, running names
+    Medium (500)                               — buttons, navigation, general UI
+    Light italic (300)                         — hints, subtitles, status, descriptive copy
+    Medium, uppercase, wide tracking           — eyebrows and field labels
+    Regular (400)                              — paths, commands, arguments, URLs, terminal
+
+  Code ligatures (`calt` / `liga`) and a slashed zero (`zero`) are on for
+  terminal output, command previews, paths and other code. They are off for
+  UI text so ordinary words are not rewritten as ligatures.
+
+  SIL Open Font License 1.1 (see JetBrainsMono-OFL.txt). Official variable
+  fonts from the JetBrains Mono v2.304 release, converted to WOFF2 with
+  fontTools (same outlines, weight axis 100–800, roman and italic):
+    https://github.com/JetBrains/JetBrainsMono
+    https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304
+  Files bundled here:
+    JetBrainsMono-Variable.woff2
+    JetBrainsMono-Italic-Variable.woff2
+  The menu bar helper on macOS keeps the system UI font.
+
