@@ -14,7 +14,7 @@ def item_for(folder):
 
 class ReadmeOpenTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="readme-open-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="readme-open-")).resolve()
         self.mac = server.IS_MAC
         self.popen = mock.patch("server.subprocess.Popen").start()
         self.addCleanup(mock.patch.stopall)

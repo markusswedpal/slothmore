@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TMP = Path(tempfile.mkdtemp(prefix="slothmore-tests-"))
+TMP = Path(tempfile.mkdtemp(prefix="slothmore-tests-")).resolve()
 os.environ["SLOTHMORE_HOME"] = str(TMP / "home")
 os.environ.pop("LAUNCHER_HOME", None)
 sys.path.insert(0, str(ROOT))
@@ -62,7 +62,10 @@ class LiveServer:
             with opener.open(req, timeout=10) as r:
                 return r.status, dict(r.headers), r.read()
         except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
+            try:
+                return e.code, dict(e.headers), e.read()
+            finally:
+                e.close()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

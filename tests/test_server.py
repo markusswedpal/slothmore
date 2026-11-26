@@ -19,7 +19,7 @@ class ServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = LiveServer()
-        cls.tmp = Path(tempfile.mkdtemp(prefix="srv-"))
+        cls.tmp = Path(tempfile.mkdtemp(prefix="srv-")).resolve()
 
     @classmethod
     def tearDownClass(cls):
@@ -60,7 +60,8 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'src="/app.js"', body)
 
     def test_static_assets_are_public(self):
-        for path in ("/app.js", "/app.css", "/markdown.js", "/manifest.webmanifest", "/sw.js"):
+        for path in ("/app.js", "/app.css", "/markdown.js", "/manifest.webmanifest", "/sw.js",
+                     "/favicon.ico", "/favicon.svg", "/icons/icon-192.png", "/icons/mark-64.png"):
             self.assertEqual(self.srv.request(path, auth=None)[0], 200, path)
 
     def test_token_link_sets_cookie_and_strips_token(self):

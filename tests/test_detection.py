@@ -46,7 +46,7 @@ RULES = {
 
 class DetectionRules(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="detect-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="detect-")).resolve()
 
     def check(self, name, files, kind, cmd, extra):
         d = make_tree(self.tmp / name.replace(" ", "_").replace("(", "").replace(")", ""), files)
