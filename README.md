@@ -1,8 +1,10 @@
 # Slothmore
 
+<img src="static/icons/icon-192.png" width="96" height="96" alt="Slothmore">
+
 A local dashboard for your code folders. Click a folder to start its web server or run its script, see the output live, and answer Y/N prompts from the page.
 
-Standard library only: no `pip install` needed for the server. Python 3.8+ (Homebrew's `python@3.12`, or the `python3` that comes with macOS, both work).
+Standard library only: no `pip` packages needed for the server. Tested on Python 3.12, 3.13, 3.14 and 3.15 (CI runs all four on Linux and macOS; the suite also passes on 3.9 and 3.10, which are not supported targets). The Homebrew formula depends on `python@3`, so it uses whichever current Python Homebrew ships and does not install a second one if you already have it. Your own `python3` is never changed.
 
 ## Install (Homebrew)
 
@@ -31,6 +33,8 @@ The service starts without a browser, so use `slothmore open` whenever you want 
 | `slothmore --no-open` | start without opening a browser |
 | `slothmore --watch ~/Projects` | add a watched folder (you can also add folders in the page with **Add** or **Watch a folder**) |
 | `slothmore --reset-token` | make a new access token, which signs out every browser and installed web app |
+| `slothmore menubar` | show Slothmore in the macOS menu bar (see [below](#start-at-login-and-the-menu-bar-icon-macos)) |
+| `slothmore menubar --install-login` | start the menu bar icon at every login (`--uninstall-login` removes it) |
 | `slothmore --version` | print the version |
 
 ## Signing in
@@ -65,7 +69,28 @@ python3 -m unittest discover -s tests -v
 
 ## Start at login, and the menu bar icon (macOS)
 
-If you installed with Homebrew, `brew services start slothmore` is the usual way to start the server at login. The scripts below are for a source checkout.
+### With Homebrew
+
+`brew services start slothmore` starts the server at login. The menu bar icon is a separate helper that the formula sets up for you: it installs `rumps` and its macOS bindings (pyobjc, pinned and hash-checked wheels from `macos/requirements-menubar.txt`) into a private venv inside the keg, so nothing touches your own Python.
+
+```
+slothmore menubar                  # show the icon now
+slothmore menubar --install-login  # start it at every login (LaunchAgent com.slothmore.menubar)
+slothmore menubar --uninstall-login
+slothmore menubar --status         # login item installed? rumps and WebKit found? where is the log?
+slothmore menubar --classic        # left click shows the classic menu instead of the quick panel
+slothmore menubar --hotkey alt+space   # optional global shortcut for the quick panel (off by default)
+```
+
+- The icon finds the server through `~/.slothmore/server.json` and signs in with `~/.slothmore/token`. If the server is not running, the menu says **Slothmore is not running** and offers **Start Slothmore**.
+- The login item logs to `~/.slothmore/menubar.log`. It restarts after a crash but stays closed after you choose **Quit menu bar helper**. It runs the `slothmore` wrapper from Homebrew's `bin`, so it keeps working after `brew upgrade`.
+- **Quick panel.** Click the icon and a dark, rounded panel opens under it with the `/compact` view: a search box (filters projects, running items and ports; Enter starts or opens the top match), **Running now** (open, restart, stop), **Quick start** (pinned and recently run first), **Ports** (Stop asks first and uses the Ports view's safe stop), an **AI** summary, and **Refresh** ⌘R, **Full view** ⌘O, **Kill all mine** (stops only what Slothmore started; asks first) and **Quit** ⌘Q. Arrow keys move through the list; Esc, a click outside or another click on the icon closes it. **Right-click** (or control-click) the icon for the classic menu. The panel needs `pyobjc-framework-WebKit` (the formula installs it); without it, or with `--classic` / `SLOTHMORE_MENUBAR_CLASSIC=1`, a click shows the menu. `--hotkey` / `SLOTHMORE_HOTKEY` set a global shortcut; macOS asks for Accessibility permission the first time. You can also open `http://127.0.0.1:7777/compact` in a browser.
+- You can also toggle it in the dashboard: the **Menu bar icon: on/off** button in the sidebar (shown on macOS only).
+- If `rumps` is missing, `slothmore menubar` prints the fix instead of an error trace. With Homebrew, run `brew postinstall slothmore` (retries the package install) or `brew reinstall markusswedpal/tap/slothmore`. After Homebrew upgrades Python itself, the venv can go stale; the wrapper then falls back to Homebrew's Python (the dashboard keeps working) and `brew postinstall slothmore` rebuilds the venv.
+
+### From a source checkout
+
+The scripts below are for a source checkout; `python3 -m pip install --user rumps` provides the helper's one dependency, and `python3 bin/slothmore menubar` works the same as above.
 
 Everything for this lives in `macos/`:
 
@@ -78,7 +103,7 @@ macos/install-login-item.sh uninstall                           # remove both (s
 ```
 
 - **Server login item:** a launchd agent (`~/Library/LaunchAgents/com.slothmore.dashboard.plist`) that starts the server at login and keeps it running, so the Dock app always has something to open. It saves your shell's `PATH`, so `npm`, `node` and Homebrew tools work. Launchd stdout/stderr: `~/.slothmore/service.log`. The app also writes `~/.slothmore/slothmore.log`. Folders are optional; you can add more in the page.
-- **Menu bar icon** (`macos/menubar.py`, optional): shows `▸ 2` when two things are running (`▸ !` when the server can't be reached). The menu has **Open Slothmore**, each running item with **Open in browser**, **Restart** and **Stop**, your **Groups** (Start all / Restart all / Stop all) and a **Start** submenu (pinned items first). It needs one package:
+- **Menu bar icon** (`macos/menubar.py`, optional): shows the sloth icon in the menu bar (a macOS template image, so it follows light and dark appearance), with a count when things are running, or `!` when the server can't be reached. The menu has **Open Slothmore**, each running item with **Open in browser**, **Restart** and **Stop**, your **Groups** (Start all / Restart all / Stop all) and a **Start** submenu (pinned items first). It needs one package:
 
   ```
   python3 -m pip install --user rumps
@@ -89,7 +114,7 @@ macos/install-login-item.sh uninstall                           # remove both (s
 
 If your folders are inside Desktop, Documents or Downloads, macOS may ask once whether `python3` may access them. Click Allow. A folder like `~/Projects` avoids the prompt.
 
-**Tested on Linux only.** The installer was checked with a dry run (`SLOTHMORE_DRY_RUN=1 LAUNCH_AGENTS_DIR=/tmp/x …` writes the plists and prints the `launchctl` commands without running them), and the menu bar helper was tested against a stand-in for rumps. Real `launchctl bootstrap`, the rumps menu itself, and macOS notifications (`osascript`) have not been run on a Mac yet. If something fails, `macos/install-login-item.sh status` and the two log files above are the first places to look.
+**Tested on Linux only.** The installer was checked with a dry run (`SLOTHMORE_DRY_RUN=1 LAUNCH_AGENTS_DIR=/tmp/x …` writes the plists and prints the `launchctl` commands without running them), and the menu bar helper was tested against a stand-in for rumps. Real `launchctl bootstrap`, the rumps menu itself, the quick panel window (NSPanel + WKWebView; its `/compact` page and the panel's sizing and message logic are tested on Linux), and macOS notifications (`osascript`) have not been run on a Mac yet. If something fails, `macos/install-login-item.sh status` and the two log files above are the first places to look.
 
 ## How it decides what to run
 
@@ -346,17 +371,22 @@ The dashboard is set entirely in **JetBrains Mono** (bundled, SIL Open Font Lice
 ## Files
 
 ```
-bin/slothmore                 CLI entry point (`open`, `url`, `--version`, `--port`, `--no-open`, `--watch`, `--reset-token`, `--log-level`)
+bin/slothmore                 CLI entry point (`open`, `url`, `--version`, `--port`, `--no-open`, `--watch`, `--reset-token`, `--log-level`, `menubar`)
 server.py                     the server (API, auth, process control, folder detection, history, health)
 static/index.html             the dashboard page (markup only)
 static/app.js, app.css        dashboard script and styles
+static/compact.html, compact.js, compact.css   quick panel (/compact) shown by the menu bar icon
 static/login.html             sign-in page shown without the access cookie
 static/markdown.js            README renderer
-static/                       also the web app manifest, service worker, icons and fonts
+static/                       also the web app manifest, service worker, icons, favicon and fonts
+static/icons/                 app icons (PWA, Apple, sidebar) and NOTES.md
+macos/icons/                  menu bar template images (black + alpha)
 tests/                        unittest suite (`python3 -m unittest discover -s tests`)
-.github/workflows/test.yml    CI on Ubuntu and macOS, Python 3.12
+.github/workflows/test.yml    CI on Ubuntu and macOS, Python 3.12 to 3.15
 macos/install-login-item.sh   launchd login items (server, optional menu bar icon)
 macos/menubar.py              menu bar icon (needs rumps)
+macos/quickpanel.py           quick panel under the icon (NSPanel + WKWebView; needs pyobjc-framework-WebKit)
+macos/requirements-menubar.txt  pinned, hash-checked rumps + pyobjc (Cocoa, WebKit) wheels (used by the Homebrew formula)
 install.sh, menubar.py        older entry points, forward to macos/
 LICENSE                       MIT, copyright 2026 Markus Wulff
 CHANGELOG.md                  release notes

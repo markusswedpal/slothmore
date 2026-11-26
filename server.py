@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Slothmore: a local dashboard that starts web servers and runs scripts from folders.
 
-Standard library only (Python 3.8+). Listens on 127.0.0.1 only.
+Standard library only (tested on Python 3.12 to 3.15). Listens on 127.0.0.1 only.
 
     slothmore
     slothmore --watch ~/Projects
@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
@@ -314,6 +314,8 @@ CATCHALL_DIRS = {
 
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
+mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("image/x-icon", ".ico")
 mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("font/woff", ".woff")
 mimetypes.add_type("font/otf", ".otf")
@@ -3239,6 +3241,15 @@ def stop_run(run):
     threading.Thread(target=reaper, daemon=True).start()
 
 
+def stop_all_mine():
+    """Stop everything Slothmore started (the quick panel's "Kill all mine"). Never touches other processes."""
+    alive = [r for r in list(RUNS.values()) if r.alive]
+    for run in alive:
+        stop_run(run)
+    LOG.info("stopped all %d Slothmore runs from the quick panel", len(alive))
+    return {"stopped": len(alive), "names": [r.name for r in alive]}
+
+
 def stop_all():
     for run in list(RUNS.values()):
         stop_run(run)
@@ -4357,8 +4368,10 @@ class Handler(BaseHTTPRequestHandler):
         if is_api and not self._authed():
             return self._send(401, {"error": "unauthorized",
                                     "detail": "Open Slothmore with `slothmore open` to sign in."})
-        if u.path in ("/", "/index.html") and not self._authed():
+        if u.path in ("/", "/index.html", "/compact", "/compact.html") and not self._authed():
             return self._login_page(401)
+        if u.path == "/compact":  # the quick panel shown by the menu bar icon
+            u = u._replace(path="/compact.html")
         try:
             if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "env":
                 if not ITEM_ID_RE.match(parts[2]):
@@ -4393,6 +4406,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, settings_public())
             if u.path == "/api/ai":
                 return self._send(200, ai_state(force=(parse_qs(u.query).get("force") or ["0"])[0] == "1"))
+            if u.path == "/api/menubar":
+                return self._send(200, menubar_login_status())
             if u.path == "/api/ports":
                 return self._send(200, {"ports": list_listening_ports(own_port=self.server.server_address[1])})
             if u.path == "/api/health":
@@ -4559,6 +4574,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ApiError(404, "unknown action")
                 self._send(200, self._listing())
+            elif u.path == "/api/menubar":
+                if "enabled" not in body or not isinstance(body["enabled"], bool):
+                    raise ApiError(400, "enabled (true or false) is required")
+                self._send(200, install_menubar_login() if body["enabled"] else uninstall_menubar_login())
+            elif u.path == "/api/runs/stop-all":
+                if body.get("confirm") is not True:
+                    raise ApiError(409, "confirm_required", detail="Stop everything Slothmore started?")
+                self._send(200, stop_all_mine())
             elif u.path == "/api/ports/stop":
                 res = stop_listening_port(
                     body.get("port"), body.get("pid"), body.get("confirm") is True,
@@ -5017,6 +5040,177 @@ def _open_url(url):
         return False
 
 
+# --------------------------------------------------------------------------- menu bar helper (macOS)
+
+MENUBAR_LABEL = "com.slothmore.menubar"
+RUMPS_HELP = ("The menu bar icon needs the Python package 'rumps', which is not installed for this Python.\n"
+              "  Homebrew install:  brew reinstall markusswedpal/tap/slothmore   (0.2.1 or newer installs it)\n"
+              "  From source:       %s -m pip install --user rumps\n"
+              "Then run `slothmore menubar` again.")
+
+
+def launch_agents_dir():
+    return Path(os.environ.get("LAUNCH_AGENTS_DIR") or (Path.home() / "Library" / "LaunchAgents"))
+
+
+def menubar_plist_path():
+    return launch_agents_dir() / (MENUBAR_LABEL + ".plist")
+
+
+def rumps_available():
+    try:
+        import importlib.util
+        return importlib.util.find_spec("rumps") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def webkit_available():
+    """PyObjC WebKit bindings present: the menu bar icon opens the quick panel instead of the classic menu."""
+    try:
+        import importlib.util
+        return all(importlib.util.find_spec(m) is not None for m in ("WebKit", "AppKit"))
+    except (ImportError, ValueError):
+        return False
+
+
+def slothmore_command():
+    """argv that starts this install of Slothmore. The Homebrew wrapper sets SLOTHMORE_BIN to a path that survives upgrades."""
+    exe = os.environ.get("SLOTHMORE_BIN")
+    if exe and os.path.isfile(exe):
+        return [exe]
+    return [sys.executable, str(HERE / "bin" / "slothmore")]
+
+
+def menubar_plist_data():
+    env = {"PATH": os.environ.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"}
+    for k in ("SLOTHMORE_HOME", "LAUNCHER_HOME", "SLOTHMORE_BIN", "SLOTHMORE_HOTKEY", "SLOTHMORE_MENUBAR_CLASSIC"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    log = str(HOME_DIR / "menubar.log")
+    return {
+        "Label": MENUBAR_LABEL,
+        "ProgramArguments": slothmore_command() + ["menubar"],
+        "WorkingDirectory": str(HERE),
+        "RunAtLoad": True,
+        # Relaunch after a crash, but not after "Quit menu bar helper" (clean exit).
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 30,
+        "LimitLoadToSessionType": "Aqua",
+        "ProcessType": "Interactive",
+        "EnvironmentVariables": env,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+
+
+def _launchctl(*args):
+    """Run launchctl with an argv list (never a shell). SLOTHMORE_DRY_RUN=1 skips it."""
+    if os.environ.get("SLOTHMORE_DRY_RUN") == "1":
+        LOG.info("[dry run] launchctl %s", " ".join(args))
+        return 0
+    try:
+        r = subprocess.run(["launchctl"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=15, check=False, shell=False)
+        if r.returncode:
+            LOG.debug("launchctl %s -> %s %s", " ".join(args), r.returncode, r.stderr.decode("utf-8", "replace").strip())
+        return r.returncode
+    except (OSError, subprocess.SubprocessError):
+        LOG.warning("launchctl failed", exc_info=True)
+        return 1
+
+
+def menubar_login_status():
+    plist = menubar_plist_path()
+    return {"supported": IS_MAC, "installed": plist.is_file(), "plist": str(plist),
+            "rumps": rumps_available(), "webkit": webkit_available(), "log": str(HOME_DIR / "menubar.log")}
+
+
+def install_menubar_login():
+    """Write the LaunchAgent and load it. Raises ApiError (400/409) with a clear message when it cannot."""
+    import plistlib
+    if not IS_MAC:
+        raise ApiError(409, "The menu bar icon only works on macOS.")
+    if not rumps_available():
+        raise ApiError(409, RUMPS_HELP % sys.executable)
+    d = launch_agents_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    plist = menubar_plist_path()
+    with open(str(plist), "wb") as f:
+        plistlib.dump(menubar_plist_data(), f)
+    uid = str(os.getuid())
+    _launchctl("bootout", "gui/%s/%s" % (uid, MENUBAR_LABEL))  # fine if it was not loaded
+    rc = _launchctl("bootstrap", "gui/%s" % uid, str(plist))
+    if rc:
+        raise ApiError(500, "launchctl could not load %s (exit %d). Try logging out and in again." % (plist, rc))
+    LOG.info("menu bar login item installed: %s", plist)
+    return menubar_login_status()
+
+
+def uninstall_menubar_login():
+    if IS_MAC:
+        _launchctl("bootout", "gui/%s/%s" % (os.getuid(), MENUBAR_LABEL))
+    try:
+        menubar_plist_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        LOG.warning("could not remove %s", menubar_plist_path(), exc_info=True)
+    LOG.info("menu bar login item removed")
+    return menubar_login_status()
+
+
+def cmd_menubar(argv):
+    """`slothmore menubar [--install-login | --uninstall-login | --status]`"""
+    ap = argparse.ArgumentParser(
+        prog="slothmore menubar",
+        description="Show Slothmore in the macOS menu bar (needs the 'rumps' package, installed by the Homebrew formula).")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--install-login", action="store_true", help="start the menu bar icon at every login")
+    g.add_argument("--uninstall-login", action="store_true", help="remove the login item")
+    g.add_argument("--status", action="store_true", help="show whether the login item is installed")
+    ap.add_argument("--url", default=None, help="dashboard address (default: read from ~/.slothmore/server.json)")
+    ap.add_argument("--classic", action="store_true",
+                    help="click shows the classic menu instead of the quick panel (or SLOTHMORE_MENUBAR_CLASSIC=1)")
+    ap.add_argument("--hotkey", default=None, metavar="KEYS",
+                    help="global shortcut that toggles the quick panel, e.g. alt+space (off by default; or SLOTHMORE_HOTKEY)")
+    args = ap.parse_args(argv)
+    if args.status:
+        s = menubar_login_status()
+        print("login item: %s (%s)\nrumps: %s\nquick panel (WebKit): %s\nlog: %s" % (
+            "installed" if s["installed"] else "not installed", s["plist"],
+            "found" if s["rumps"] else "missing", "found" if s.get("webkit") else "missing (classic menu)", s["log"]))
+        return 0
+    if args.uninstall_login:
+        uninstall_menubar_login()
+        print("Menu bar login item removed.")
+        return 0
+    if not IS_MAC:
+        sys.stderr.write("The menu bar icon only works on macOS.\n")
+        return 2
+    if not rumps_available():
+        sys.stderr.write(RUMPS_HELP % sys.executable + "\n")
+        return 2
+    if args.install_login:
+        try:
+            install_menubar_login()
+        except ApiError as e:
+            sys.stderr.write(str(e.payload.get("error")) + "\n")
+            return 2
+        print("Menu bar login item installed (%s). It starts at every login; log: %s" % (
+            menubar_plist_path(), HOME_DIR / "menubar.log"))
+        return 0
+    ensure_private_dirs()
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("slothmore_menubar", str(HERE / "macos" / "menubar.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fwd = (["--url", args.url] if args.url else []) + (["--classic"] if args.classic else []) + \
+        (["--hotkey", args.hotkey] if args.hotkey else [])
+    return mod.main(fwd)
+
+
 def cmd_open(argv, print_only=False):
     """`slothmore open` / `slothmore url`: sign in to an already running server (for example brew services)."""
     ap = argparse.ArgumentParser(prog="slothmore " + ("url" if print_only else "open"),
@@ -5047,11 +5241,13 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in ("open", "url"):
         return cmd_open(argv[1:], print_only=argv[0] == "url")
+    if argv and argv[0] == "menubar":
+        return cmd_menubar(argv[1:])
     ap = argparse.ArgumentParser(
         prog="slothmore",
         description="Slothmore: a local dashboard that starts web servers and runs scripts from folders.",
         epilog="Subcommands: `slothmore open` opens a running dashboard signed in; "
-               "`slothmore url` prints its signed-in address.",
+               "`slothmore url` prints its signed-in address; `slothmore menubar` shows the macOS menu bar icon.",
     )
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument(

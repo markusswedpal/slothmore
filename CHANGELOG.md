@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.1 (2026-11-26)
+
+### Added
+- **Custom icon.** The sloth mark is used for the web app (including a maskable icon), the favicon, the sidebar, the sign-in page, the README, and the macOS menu bar (a template image that follows light and dark appearance).
+- **`slothmore menubar`** starts the macOS menu bar icon. It reads the port from `~/.slothmore/server.json` and the token from `~/.slothmore/token`. When the server is not running it shows "Slothmore is not running" with a **Start Slothmore** item.
+- **`slothmore menubar --install-login` / `--uninstall-login` / `--status`** manage a LaunchAgent (`~/Library/LaunchAgents/com.slothmore.menubar.plist`) that starts the icon at login (log: `~/.slothmore/menubar.log`). The dashboard has a matching **Menu bar icon** button (`GET`/`POST /api/menubar`, authenticated; macOS only).
+- If `rumps` is missing, the command prints how to fix it instead of a traceback.
+- **Quick panel.** Clicking the menu bar icon opens a borderless, rounded, dark panel under the icon (420 pt wide, up to 600 pt tall) instead of a menu. It shows the new `/compact` page in a WKWebView: a search box that filters projects, running items and ports (Enter starts or opens the top match), **Running now** (open, restart, stop), **Quick start** (pinned and recently run first), **Ports** (process, PID, ports; multi-port processes expand; Stop asks first and uses the same safe stop as the Ports view), an **AI** summary (local model servers and agents), and **Refresh** (⌘R), **Full view** (⌘O), **Kill all mine** and **Quit** (⌘Q). Arrow keys move, Esc closes, and so do a click outside or a second click on the icon. Right-click (or control-click) the icon for the classic menu. `--classic` or `SLOTHMORE_MENUBAR_CLASSIC=1` keeps the menu on left click, and without `pyobjc-framework-WebKit` the helper falls back to the menu by itself. An optional global shortcut (`--hotkey alt+space` or `SLOTHMORE_HOTKEY`) is off by default.
+- `/compact` also works in a normal browser tab. It needs the same sign-in as the dashboard and follows the same CSP (no inline script or style).
+- `POST /api/runs/stop-all` with `{"confirm": true}` stops everything Slothmore started ("Kill all mine"). Other processes are never touched.
+- **Homebrew formula** installs `rumps` and pyobjc (Cocoa and WebKit) into a private venv from pinned, hash-checked wheels (`macos/requirements-menubar.txt`, installed in `post_install`, macOS only). The `slothmore` wrapper uses that venv and falls back to Homebrew's Python if it is missing.
+
+### Changed
+- The formula depends on `python@3` (the current Homebrew Python) instead of `python@3.12`.
+- CI runs Python 3.12, 3.13, 3.14 and 3.15 on Ubuntu and macOS (3.15 may fail without blocking).
+- Tests resolve their temporary folders, which fixes four README-open tests on macOS where `/var` is a symlink to `/private/var`.
+
+## 0.2.0
 
 Security hardening after a code review.
 
