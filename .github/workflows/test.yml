@@ -13,12 +13,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13", "3.14", "3.15"]
     runs-on: ${{ matrix.os }}
+    # The newest Python may still be a pre-release on the runners: report it, but don't block on it.
+    continue-on-error: ${{ matrix.python == '3.15' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
