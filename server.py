@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
@@ -5120,10 +5120,36 @@ def _launchctl(*args):
         return 1
 
 
+def menubar_panel_state():
+    """'on', or 'off' when the menu bar helper's crash guard switched the quick panel off for this version."""
+    try:
+        st = json.loads((HOME_DIR / "menubar.state").read_text())
+    except (OSError, ValueError):
+        return "on"
+    if not isinstance(st, dict):
+        return "on"
+    if st.get("state") == "panel-disabled" and st.get("version") == __version__:
+        return "off"
+    if st.get("state") == "starting-panel":
+        return "starting"
+    return "on"
+
+
 def menubar_login_status():
     plist = menubar_plist_path()
     return {"supported": IS_MAC, "installed": plist.is_file(), "plist": str(plist),
-            "rumps": rumps_available(), "webkit": webkit_available(), "log": str(HOME_DIR / "menubar.log")}
+            "rumps": rumps_available(), "webkit": webkit_available(), "log": str(HOME_DIR / "menubar.log"),
+            "panel": menubar_panel_state()}
+
+
+def reset_menubar_panel():
+    """Forget the crash guard's 'quick panel off' note and restart the login item if it is installed."""
+    try:
+        (HOME_DIR / "menubar.state").unlink()
+    except FileNotFoundError:
+        pass
+    if IS_MAC and menubar_plist_path().is_file():
+        _launchctl("kickstart", "-k", "gui/%s/%s" % (os.getuid(), MENUBAR_LABEL))
 
 
 def install_menubar_login():
@@ -5170,6 +5196,8 @@ def cmd_menubar(argv):
     g.add_argument("--install-login", action="store_true", help="start the menu bar icon at every login")
     g.add_argument("--uninstall-login", action="store_true", help="remove the login item")
     g.add_argument("--status", action="store_true", help="show whether the login item is installed")
+    g.add_argument("--reset-panel", action="store_true",
+                   help="turn the quick panel back on after a crash switched it off (restarts the login item)")
     ap.add_argument("--url", default=None, help="dashboard address (default: read from ~/.slothmore/server.json)")
     ap.add_argument("--classic", action="store_true",
                     help="click shows the classic menu instead of the quick panel (or SLOTHMORE_MENUBAR_CLASSIC=1)")
@@ -5178,9 +5206,16 @@ def cmd_menubar(argv):
     args = ap.parse_args(argv)
     if args.status:
         s = menubar_login_status()
-        print("login item: %s (%s)\nrumps: %s\nquick panel (WebKit): %s\nlog: %s" % (
+        panel = {"on": "on", "starting": "was opening when the helper last stopped",
+                 "off": "off after a crash (run: slothmore menubar --reset-panel)"}[s["panel"]]
+        print("login item: %s (%s)\nrumps: %s\nquick panel (WebKit): %s\nquick panel: %s\nlog: %s" % (
             "installed" if s["installed"] else "not installed", s["plist"],
-            "found" if s["rumps"] else "missing", "found" if s.get("webkit") else "missing (classic menu)", s["log"]))
+            "found" if s["rumps"] else "missing", "found" if s.get("webkit") else "missing (classic menu)",
+            panel, s["log"]))
+        return 0
+    if args.reset_panel:
+        reset_menubar_panel()
+        print("Quick panel turned back on%s." % (" and the menu bar helper restarted" if menubar_plist_path().is_file() else ""))
         return 0
     if args.uninstall_login:
         uninstall_menubar_login()
@@ -5193,6 +5228,11 @@ def cmd_menubar(argv):
         sys.stderr.write(RUMPS_HELP % sys.executable + "\n")
         return 2
     if args.install_login:
+        # --classic / --hotkey given with --install-login are kept in the login item's environment.
+        if args.classic:
+            os.environ["SLOTHMORE_MENUBAR_CLASSIC"] = "1"
+        if args.hotkey:
+            os.environ["SLOTHMORE_HOTKEY"] = args.hotkey
         try:
             install_menubar_login()
         except ApiError as e:

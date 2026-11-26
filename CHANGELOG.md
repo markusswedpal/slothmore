@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 (2026-11-26)
+
+### Fixed
+- **Menu bar helper crashed when the quick panel opened** (`OC_PythonException: cannot call block without a signature`, seen with Homebrew Python 3.15 and pyobjc 13.1). The panel called WebKit's navigation `decisionHandler` block from Python. The navigation policy now runs in `webView:didStartProvisionalNavigation:` and stops anything that isn't this Slothmore server (other http(s) pages still open in the browser), so Python never calls an Objective-C block. The "server is starting" retry uses `performSelector:afterDelay:` instead of a timer block.
+- The `ObjCPointerWarning` about `CGColor` is gone. The window and web view are transparent and `compact.css` draws the rounded dark card and its border; the native side only clips the corners.
+- Every callback from Cocoa into Python (web view and window delegates, the icon click, event monitors) catches errors. An error logs its traceback to `~/.slothmore/menubar.log`, turns the panel off for the session and gives the icon its classic menu back, with a notification, instead of terminating the helper.
+- Optional AppKit/WebKit calls are checked with `respondsToSelector:` first; `NSApplication.activate` is used on macOS 14+.
+- The quick panel module is loaded once per process, so its Objective-C classes are never defined twice.
+
+### Added
+- **Crash guard.** Before the panel is shown for the first time the helper writes `~/.slothmore/menubar.state`, and clears it once the first page has loaded. If the helper dies in between, the LaunchAgent restart starts with the classic menu instead of crash-looping. The panel stays off for that version until `slothmore menubar --reset-panel` (which also restarts the login item) or the next upgrade. `slothmore menubar --status` shows the panel state.
+- `--classic` and `--hotkey` given together with `slothmore menubar --install-login` are now kept in the login item (`SLOTHMORE_MENUBAR_CLASSIC`, `SLOTHMORE_HOTKEY`).
+
 ## 0.2.1 (2026-11-26)
 
 ### Added
