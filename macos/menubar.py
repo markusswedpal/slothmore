@@ -19,7 +19,11 @@ import json
 import os
 import subprocess
 import sys
+import time
+import traceback
 import urllib.request
+
+VERSION = "0.2.2"  # keep in sync with server.__version__ (a test checks it)
 
 DEFAULT_URL = os.environ.get("SLOTHMORE_URL") or os.environ.get("LAUNCHER_URL") or "http://127.0.0.1:7777"
 MAX_STOPPED = 20  # stopped items listed under "Start"
@@ -155,12 +159,93 @@ def open_dashboard(base):
 
 
 def load_quickpanel():
-    """macos/quickpanel.py, loaded by path (this file is itself loaded by path from `slothmore menubar`)."""
+    """macos/quickpanel.py, loaded by path once per process (this file is itself loaded by path from `slothmore menubar`).
+
+    Loaded once because its Objective-C class names are global to the process."""
+    name = "slothmore_quickpanel"
+    if name in sys.modules:
+        return sys.modules[name]
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickpanel.py")
-    spec = importlib.util.spec_from_file_location("slothmore_quickpanel", path)
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    sys.modules[name] = mod
     return mod
+
+
+# --------------------------------------------------------------------------- crash guard for the quick panel
+# Before the panel is shown for the first time the helper writes ~/.slothmore/menubar.state = starting-panel,
+# and clears it once the first page has loaded. If the helper dies in between (a native crash Python can't
+# catch), the LaunchAgent restarts it, it finds the marker and starts with the classic menu instead of
+# crash-looping. The panel stays off for this version; upgrading or `slothmore menubar --reset-panel` retries it.
+
+STATE_FILE = "menubar.state"
+STARTING, DISABLED = "starting-panel", "panel-disabled"
+
+
+def state_path():
+    return os.path.join(home_dir(), STATE_FILE)
+
+
+def read_panel_state():
+    try:
+        with open(state_path()) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_panel_state(state, **extra):
+    st = dict(extra, state=state, version=VERSION, at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    path = state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log("could not write %s: %s" % (path, e))
+
+
+def clear_panel_state():
+    try:
+        os.remove(state_path())
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log("could not remove %s: %s" % (state_path(), e))
+
+
+def panel_blocked():
+    """Reason the quick panel must not be tried in this launch, or None. Turns a leftover marker into 'disabled'."""
+    st = read_panel_state()
+    if st.get("state") == STARTING:
+        write_panel_state(DISABLED, reason="the helper stopped while opening the quick panel (%s)" % st.get("at", "?"),
+                          crashed_version=st.get("version"))
+        return "the last launch stopped while opening the quick panel"
+    if st.get("state") == DISABLED and st.get("version") == VERSION:
+        return st.get("reason") or "the quick panel was turned off after a crash"
+    return None
+
+
+def panel_state_summary():
+    st = read_panel_state()
+    if st.get("state") == DISABLED and st.get("version") == VERSION:
+        return "off after a crash (%s); `slothmore menubar --reset-panel` turns it back on" % st.get("at", "?")
+    if st.get("state") == STARTING:
+        return "was opening when the helper last stopped; the next launch uses the classic menu"
+    return "on"
+
+
+def log(msg):
+    try:
+        sys.stderr.write("[menubar %s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def open_url(url):
@@ -188,19 +273,49 @@ def make_app(rumps, client, panel=True, hotkey=None):
 
         def attach_panel(self):
             """Swap the menu click for the quick panel. Any failure keeps the classic menu."""
+            blocked = panel_blocked()
+            if blocked:
+                log("Quick panel off: %s. Using the classic menu; run `slothmore menubar --reset-panel` to try it again." % blocked)
+                return
             try:
                 qp = load_quickpanel()
                 if not qp.available():
                     sys.stderr.write("Quick panel needs pyobjc-framework-WebKit; using the classic menu.\n")
                     return
                 self.quick = qp.attach(
-                    self._nsapp.nsstatusitem, lambda: client.base, read_token,
-                    {"quit": lambda: rumps.quit_application(), "open_full": lambda: open_dashboard(client.base),
-                     "open_url": open_url, "start_server": start_server},
+                    self._nsapp.nsstatusitem, lambda: client.base, read_token, self.panel_hooks(),
                     hotkey=qp.parse_hotkey(hotkey) if hotkey else None)
-            except Exception as e:  # WebKit/pyobjc problem: the rumps menu still works
+            except ImportError as e:  # WebKit/pyobjc missing: the rumps menu still works
                 sys.stderr.write("Quick panel unavailable (%s: %s); using the classic menu.\n" % (type(e).__name__, e))
                 self.quick = None
+            except Exception as e:  # any other Cocoa problem: keep the details in the log
+                sys.stderr.write("Quick panel unavailable (%s: %s); using the classic menu.\n%s" % (
+                    type(e).__name__, e, traceback.format_exc()))
+                self.quick = None
+
+        def panel_hooks(self):
+            def quit_helper():
+                clear_panel_state()  # a clean quit is not a crash
+                rumps.quit_application()
+
+            def failed(where):
+                self.quick = None
+                clear_panel_state()  # the error was caught: not a crash, so the next launch may try again
+                try:
+                    rumps.notification("Slothmore", "Quick panel turned off",
+                                       "Using the classic menu. Details: ~/.slothmore/menubar.log")
+                except Exception:
+                    pass
+
+            return {"quit": quit_helper, "open_full": lambda: open_dashboard(client.base),
+                    "open_url": open_url, "start_server": start_server,
+                    "panel_starting": lambda: write_panel_state(STARTING),
+                    "panel_ok": clear_panel_state, "panel_failed": failed}
+
+        def _quit(self, _sender):
+            if read_panel_state().get("state") == STARTING:
+                clear_panel_state()  # a clean quit is not a crash
+            rumps.quit_application()
 
         def _safe(self, fn):
             def cb(_sender):
@@ -259,7 +374,7 @@ def make_app(rumps, client, panel=True, hotkey=None):
                         smenu.add(rumps.MenuItem("… %d more in the dashboard" % model["more"]))
                     self.menu.add(smenu)
             self.menu.add(rumps.separator)
-            self.menu.add(rumps.MenuItem("Quit menu bar helper", callback=lambda _: rumps.quit_application()))
+            self.menu.add(rumps.MenuItem("Quit menu bar helper", callback=self._quit))
             self.title = model["title"]
 
         @rumps.timer(4)
@@ -279,7 +394,13 @@ def main(argv=None):
     ap.add_argument("--classic", action="store_true", help="click shows the classic menu, not the quick panel")
     ap.add_argument("--hotkey", default=os.environ.get("SLOTHMORE_HOTKEY") or None,
                     help="global shortcut for the quick panel, e.g. alt+space (off by default)")
+    ap.add_argument("--reset-panel", action="store_true",
+                    help="turn the quick panel back on after the crash guard switched it off, then exit")
     args = ap.parse_args(argv)
+    if args.reset_panel:
+        clear_panel_state()
+        print("Quick panel re-enabled. Restart the menu bar helper (or log out and in) to use it.")
+        return 0
     if args.hotkey:
         try:
             load_quickpanel().parse_hotkey(args.hotkey)

@@ -8,7 +8,9 @@ needs pyobjc-framework-Cocoa and pyobjc-framework-WebKit; if either is missing, 
 returns False and the helper keeps the classic rumps menu.
 """
 import importlib.util
+import sys
 import time
+import traceback
 import urllib.parse
 
 PANEL_WIDTH = 420
@@ -18,7 +20,6 @@ PANEL_START_HEIGHT = 520
 PANEL_GAP = 6          # points between the menu bar and the panel
 SCREEN_MARGIN = 8      # keep the panel this far from the screen edges
 CORNER_RADIUS = 14
-BG_RGB = (0x0B, 0x10, 0x16)   # #0B1016, same as the page
 REOPEN_GUARD = 0.3     # a click on the icon right after the panel closed itself should not reopen it
 ACTIONS = ("close", "quit", "openFull", "openURL", "height", "startServer", "retry")
 
@@ -169,13 +170,78 @@ def offline_html():
 
 
 # --------------------------------------------------------------------------- Cocoa (macOS only)
+#
+# Rules that keep this part crash-free under PyObjC. 0.2.1 aborted with
+# "OC_PythonException: cannot call block without a signature": Python called the WKNavigationDelegate
+# decisionHandler block, and PyObjC had no signature for it.
+#  * Python never calls an Objective-C block. The navigation policy runs in
+#    webView:didStartProvisionalNavigation: (no decisionHandler), and the retry timer uses
+#    performSelector:withObject:afterDelay: instead of a timer block. Blocks we hand to Cocoa
+#    (event monitor handlers) are plain Python callables wrapped in _guarded().
+#  * No Core Graphics value (CGColorRef) crosses into Python. The window and the web view are
+#    transparent and compact.css draws the rounded dark card and its border.
+#  * Everything Cocoa calls into (delegate methods, the icon action, monitor handlers) runs inside
+#    _guard(), which catches every Python exception. An exception that escapes into Cocoa's run loop
+#    terminates the whole app. A caught exception turns the panel off for the rest of the session
+#    and gives the icon its classic menu back.
+#  * Optional selectors are checked with respondsToSelector_ before they are called.
+
+NAV_CANCELLED = -999   # NSURLErrorCancelled: we stopped a navigation ourselves
+MOUSE_DOWN_MASK = (1 << 1) | (1 << 3)   # NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown
+KEY_DOWN_MASK = 1 << 10                 # NSEventMaskKeyDown
+STYLE_MASK = 1 << 7                     # NSWindowStyleMaskBorderless (0) | NSWindowStyleMaskNonactivatingPanel
+POPUP_LEVEL = 101                       # NSPopUpMenuWindowLevel
+COLLECTION = (1 << 0) | (1 << 3) | (1 << 8)   # CanJoinAllSpaces | Transient | FullScreenAuxiliary (a valid combination)
+AUTORESIZE_WH = 2 | 16                  # NSViewWidthSizable | NSViewHeightSizable
 
 _CLASSES = {}
 _CONTROLLER = []
 
 
+def _log(msg):
+    try:
+        sys.stderr.write("[quick panel] %s\n" % msg)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _guard(where, fn, *args, **kwargs):
+    """Run fn; never let a Python exception reach Cocoa. On error: log the traceback and switch the panel off."""
+    default = kwargs.pop("default", None)
+    try:
+        return fn(*args)
+    except Exception:
+        _log("error in %s; switching to the classic menu for this session.\n%s" % (where, traceback.format_exc()))
+        ctl = _CONTROLLER[0] if _CONTROLLER else None
+        if ctl is not None:
+            ctl.fail(where)
+        return default
+
+
+def _guarded(where, fn, default=None):
+    """fn wrapped by _guard, for callables handed to Cocoa (event monitor handlers)."""
+    def wrapper(*args):
+        return _guard(where, fn, *args, default=default)
+    return wrapper
+
+
+def _ctl(where, method, *args, **kwargs):
+    """Call a QuickPanel method from an Objective-C callback (no-op once the panel is switched off)."""
+    if not _CONTROLLER:
+        return kwargs.get("default")
+    return _guard(where, getattr(_CONTROLLER[0], method), *args, **kwargs)
+
+
+def _responds(obj, name):
+    try:
+        return bool(obj.respondsToSelector_(name))
+    except Exception:
+        return False
+
+
 def _classes():
-    """Define the Objective-C subclasses once per process."""
+    """Define the Objective-C subclasses once per process (the class names are global to the runtime)."""
     if _CLASSES:
         return _CLASSES
     import objc
@@ -183,7 +249,14 @@ def _classes():
     from AppKit import NSPanel
     from Foundation import NSObject
 
+    try:  # this module was loaded a second time in the same process: reuse the classes
+        _CLASSES.update(panel=objc.lookUpClass("SlothmoreQuickPanel"), bridge=objc.lookUpClass("SlothmoreQuickPanelBridge"))
+        return _CLASSES
+    except objc.nosuchclass_error:
+        pass
+
     class SlothmoreQuickPanel(NSPanel):
+        # A borderless panel only takes keyboard focus (the search field) when it says it can.
         def canBecomeKeyWindow(self):
             return True
 
@@ -191,41 +264,66 @@ def _classes():
             return False
 
         def cancelOperation_(self, sender):
-            if _CONTROLLER:
-                _CONTROLLER[0].hide()
+            _ctl("Esc", "hide")
 
-    protocols = [objc.protocolNamed(n) for n in ("WKScriptMessageHandler", "WKNavigationDelegate", "NSWindowDelegate")]
+    names = ("WKScriptMessageHandler", "WKNavigationDelegate", "NSWindowDelegate")
+    protocols = []
+    for n in names:
+        try:
+            protocols.append(objc.protocolNamed(n))
+        except Exception:
+            _log("protocol %s not found; continuing without it" % n)
 
     class SlothmoreQuickPanelBridge(NSObject, protocols=protocols):
+        # WKScriptMessageHandler: messages from compact.js
         def userContentController_didReceiveScriptMessage_(self, ucc, message):
-            if _CONTROLLER:
-                _CONTROLLER[0].on_message(message.body())
+            _ctl("script message", "on_message_obj", message)
 
-        def webView_decidePolicyForNavigationAction_decisionHandler_(self, webview, action, handler):
-            url = action.request().URL()
-            ok = _CONTROLLER[0].on_navigate(str(url.absoluteString()) if url else "") if _CONTROLLER else False
-            handler(1 if ok else 0)  # WKNavigationActionPolicyAllow / Cancel
+        # WKNavigationDelegate. Deliberately no webView:decidePolicyForNavigationAction:decisionHandler:
+        # (calling its block from Python is what crashed 0.2.1).
+        def webView_didStartProvisionalNavigation_(self, webview, nav):
+            _ctl("navigation start", "on_provisional", webview)
+
+        def webView_didReceiveServerRedirectForProvisionalNavigation_(self, webview, nav):
+            _ctl("navigation redirect", "on_provisional", webview)
+
+        def webView_didFinishNavigation_(self, webview, nav):
+            _ctl("navigation finish", "on_loaded")
 
         def webView_didFailProvisionalNavigation_withError_(self, webview, nav, error):
-            if _CONTROLLER:
-                _CONTROLLER[0].show_offline()
+            _ctl("navigation failure", "on_load_failed", error)
 
+        def webView_didFailNavigation_withError_(self, webview, nav, error):
+            _ctl("navigation failure", "on_load_failed", error, False)
+
+        def webViewWebContentProcessDidTerminate_(self, webview):
+            _ctl("web content process ended", "on_web_process_ended")
+
+        # NSWindowDelegate: clicking anywhere else takes key focus away, which closes the panel
         def windowDidResignKey_(self, note):
-            if _CONTROLLER:
-                _CONTROLLER[0].hide()
+            _ctl("panel lost focus", "hide")
 
+        # Target/action of the status item button, and the delayed retry
         def statusClicked_(self, sender):
-            if _CONTROLLER:
-                _CONTROLLER[0].status_clicked()
+            _ctl("icon click", "status_clicked")
+
+        def retryLoad_(self, sender):
+            _ctl("retry", "retry")
 
     _CLASSES.update(panel=SlothmoreQuickPanel, bridge=SlothmoreQuickPanelBridge)
     return _CLASSES
 
 
-def install_edit_menu():
+def _shared_app():
+    from AppKit import NSApplication
+    return NSApplication.sharedApplication()
+
+
+def install_edit_menu(app=None):
     """Without an Edit menu, ⌘C/⌘V/⌘A don't work in a web view text field. The menu stays invisible (accessory app)."""
-    from AppKit import NSApp, NSMenu, NSMenuItem
-    if NSApp.mainMenu() is not None:
+    from AppKit import NSMenu, NSMenuItem
+    app = app or _shared_app()
+    if app.mainMenu() is not None:
         return
     main, app_item, edit_item = NSMenu.alloc().init(), NSMenuItem.alloc().init(), NSMenuItem.alloc().init()
     main.addItem_(app_item)
@@ -236,29 +334,33 @@ def install_edit_menu():
         edit.addItemWithTitle_action_keyEquivalent_(title, sel, key)
     edit_item.setSubmenu_(edit)
     main.addItem_(edit_item)
-    NSApp.setMainMenu_(main)
+    app.setMainMenu_(main)
 
 
 class QuickPanel:
-    """Owns the NSPanel + WKWebView and the status item click. `hooks` supplies quit/open_full/open_url/start_server."""
+    """Owns the NSPanel + WKWebView and the status item click.
+
+    hooks: quit, open_full, open_url, start_server (required) and, optionally, panel_starting (before the
+    first show), panel_ok (first page shown) and panel_failed(where) (panel switched off after an error).
+    """
 
     def __init__(self, status_item, base_fn, token_fn, hooks, hotkey=None):
-        from AppKit import (NSApp, NSBackingStoreBuffered, NSColor, NSMakeRect, NSView)
+        from AppKit import NSBackingStoreBuffered, NSColor, NSMakeRect, NSView
         from WebKit import WKWebView, WKWebViewConfiguration
         C = _classes()
-        _CONTROLLER[:] = [self]
         self.status_item, self.base_fn, self.token_fn, self.hooks = status_item, base_fn, token_fn, hooks
         self.last_hidden_at, self.loaded_base, self.monitor, self.hotkey_monitors = None, None, None, []
+        self.failed, self.first_show_pending, self.classic_menu, self.wired = False, True, None, False
+        self.app = _shared_app()
         self.bridge = C["bridge"].alloc().init()
         self.frame = (0, 0, PANEL_WIDTH, PANEL_START_HEIGHT)
 
-        style = (1 << 7)  # NSWindowStyleMaskBorderless (0) | NSWindowStyleMaskNonactivatingPanel
         panel = C["panel"].alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, PANEL_WIDTH, PANEL_START_HEIGHT), style, NSBackingStoreBuffered, False)
-        panel.setLevel_(101)                      # NSPopUpMenuWindowLevel: above normal windows
-        panel.setCollectionBehavior_((1 << 0) | (1 << 3) | (1 << 8))  # all Spaces, transient, full-screen auxiliary
+            NSMakeRect(0, 0, PANEL_WIDTH, PANEL_START_HEIGHT), STYLE_MASK, NSBackingStoreBuffered, False)
+        panel.setLevel_(POPUP_LEVEL)
+        panel.setCollectionBehavior_(COLLECTION)
         panel.setOpaque_(False)
-        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setBackgroundColor_(NSColor.clearColor())   # transparent window; compact.css draws the card
         panel.setHasShadow_(True)
         panel.setHidesOnDeactivate_(False)
         panel.setReleasedWhenClosed_(False)
@@ -266,52 +368,107 @@ class QuickPanel:
         panel.setBecomesKeyOnlyIfNeeded_(False)
         panel.setDelegate_(self.bridge)
 
-        bg = NSColor.colorWithSRGBRed_green_blue_alpha_(BG_RGB[0] / 255.0, BG_RGB[1] / 255.0, BG_RGB[2] / 255.0, 1.0)
+        # Rounded clipping only (cornerRadius/masksToBounds are plain numbers/bools; no CGColor is used).
         root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_WIDTH, PANEL_START_HEIGHT))
         root.setWantsLayer_(True)
-        root.layer().setCornerRadius_(CORNER_RADIUS)
-        root.layer().setMasksToBounds_(True)
-        root.layer().setBackgroundColor_(bg.CGColor())
-        root.layer().setBorderWidth_(0.5)
-        root.layer().setBorderColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(0.7, 0.86, 0.88, 0.22).CGColor())
+        layer = root.layer()
+        if layer is not None:
+            layer.setCornerRadius_(CORNER_RADIUS)
+            layer.setMasksToBounds_(True)
 
         config = WKWebViewConfiguration.alloc().init()
         config.userContentController().addScriptMessageHandler_name_(self.bridge, "slothmore")
         web = WKWebView.alloc().initWithFrame_configuration_(root.bounds(), config)
-        web.setAutoresizingMask_(2 | 16)  # width + height sizable
+        web.setAutoresizingMask_(AUTORESIZE_WH)
         web.setNavigationDelegate_(self.bridge)
-        try:
-            web.setValue_forKey_(False, "drawsBackground")  # no white flash before the page paints
+        try:  # no white flash before the page paints (private KVC key; harmless if it ever goes away)
+            web.setValue_forKey_(False, "drawsBackground")
         except Exception:
-            pass
-        try:
-            web.setUnderPageBackgroundColor_(bg)
-        except Exception:
-            pass
+            _log("web view has no drawsBackground; the background may flash white")
+        if _responds(web, "setUnderPageBackgroundColor:"):   # macOS 12+
+            web.setUnderPageBackgroundColor_(NSColor.clearColor())
         root.addSubview_(web)
         panel.setContentView_(root)
-        self.panel, self.web, self.NSApp = panel, web, NSApp
-        install_edit_menu()
+        self.panel, self.web = panel, web
+        try:
+            install_edit_menu(self.app)
+        except Exception:
+            _log("could not add the Edit menu (copy/paste shortcuts may not work):\n" + traceback.format_exc())
 
-        # Left click opens the panel; right/control click shows the classic menu.
-        self.classic_menu = status_item.menu()
-        status_item.setMenu_(None)
-        button = status_item.button()
-        button.setTarget_(self.bridge)
-        button.setAction_("statusClicked:")
-        button.sendActionOn_((1 << 2) | (1 << 4))  # left + right mouse up
+        _CONTROLLER[:] = [self]
+        self._wire_status_item()
         if hotkey:
-            self._install_hotkey(hotkey)
+            try:
+                self._install_hotkey(hotkey)
+            except Exception:
+                _log("global shortcut unavailable:\n" + traceback.format_exc())
+
+    def _wire_status_item(self):
+        """Left click opens the panel; right/control click shows the classic menu. Restores the menu if wiring fails."""
+        self.classic_menu = self.status_item.menu()
+        try:
+            button = self.status_item.button()
+            button.setTarget_(self.bridge)
+            button.setAction_("statusClicked:")
+            button.sendActionOn_((1 << 2) | (1 << 4))  # NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp
+            self.status_item.setMenu_(None)
+            self.wired = True
+        except Exception:
+            _CONTROLLER[:] = []
+            self._restore_classic()
+            raise
+
+    def _restore_classic(self):
+        try:
+            button = self.status_item.button()
+            button.setAction_(None)
+            button.setTarget_(None)
+        except Exception:
+            pass
+        try:
+            if self.classic_menu is not None:
+                self.status_item.setMenu_(self.classic_menu)
+        except Exception:
+            pass
+
+    def fail(self, where):
+        """Switch the panel off for this session and give the icon its classic menu back. Never raises."""
+        if self.failed:
+            return
+        self.failed = True
+        if _CONTROLLER and _CONTROLLER[0] is self:
+            _CONTROLLER[:] = []
+        for m in [self.monitor] + list(self.hotkey_monitors):
+            if m is not None:
+                try:
+                    from AppKit import NSEvent
+                    NSEvent.removeMonitor_(m)
+                except Exception:
+                    pass
+        self.monitor, self.hotkey_monitors = None, []
+        try:
+            self.panel.orderOut_(None)
+        except Exception:
+            pass
+        self._restore_classic()
+        cb = self.hooks.get("panel_failed")
+        if cb:
+            try:
+                cb(where)
+            except Exception:
+                _log("panel_failed hook raised:\n" + traceback.format_exc())
 
     # -- status item
     def status_clicked(self):
-        ev = self.NSApp.currentEvent()
-        right = ev is not None and (ev.type() == 4 or (ev.modifierFlags() & (1 << 18)))
+        ev = self.app.currentEvent()
+        right = ev is not None and (ev.type() == 4 or (ev.modifierFlags() & (1 << 18)))  # NSEventTypeRightMouseUp / ctrl
         if right and self.classic_menu is not None:
             self.hide()
             self.status_item.setMenu_(self.classic_menu)
-            self.status_item.button().performClick_(None)   # runs the menu modally
-            self.status_item.setMenu_(None)
+            try:
+                self.status_item.button().performClick_(None)   # runs the menu modally
+            finally:
+                self.status_item.setMenu_(None)
             return
         self.toggle()
 
@@ -322,46 +479,69 @@ class QuickPanel:
             self.show()
 
     def _button_rect(self):
+        from AppKit import NSScreen
         button = self.status_item.button()
         win = button.window()
         r = win.convertRectToScreen_(button.convertRect_toView_(button.bounds(), None))
-        screen = win.screen()
-        if screen is None:
-            from AppKit import NSScreen
-            screen = NSScreen.mainScreen()
+        screen = win.screen() or NSScreen.mainScreen()
         v = screen.visibleFrame()
         return (r.origin.x, r.origin.y, r.size.width, r.size.height), (v.origin.x, v.origin.y, v.size.width, v.size.height)
 
+    def _activate(self):
+        if _responds(self.app, "activate"):        # macOS 14+
+            self.app.activate()
+        else:
+            self.app.activateIgnoringOtherApps_(True)
+
     def show(self):
-        from AppKit import NSEvent, NSMakeRect
+        from AppKit import NSMakeRect
+        if self.first_show_pending:
+            cb = self.hooks.get("panel_starting")
+            if cb:
+                cb()
         base = self.base_fn()
         if self.loaded_base != base:
             self.load(base)
         btn, vis = self._button_rect()
         self.frame = panel_frame(btn, vis, height=self.frame[3])
         self.panel.setFrame_display_(NSMakeRect(*self.frame), True)
-        self.NSApp.activateIgnoringOtherApps_(True)
+        self._activate()
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeFirstResponder_(self.web)
         self.panel.invalidateShadow()
         self.web.evaluateJavaScript_completionHandler_("window.slothmoreShown && window.slothmoreShown()", None)
-        if self.monitor is None:  # clicks in other apps close the panel
-            self.monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_((1 << 1) | (1 << 3), lambda e: self.hide())
+        if self.monitor is None:  # clicks in other apps close the panel (losing key focus does too)
+            try:
+                from AppKit import NSEvent
+                self.monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    MOUSE_DOWN_MASK, _guarded("outside click", lambda e: self.hide()))
+            except Exception:
+                _log("click-outside monitor unavailable (the panel still closes when it loses focus):\n" + traceback.format_exc())
+                self.monitor = None
 
     def hide(self):
-        from AppKit import NSEvent
         if self.monitor is not None:
-            NSEvent.removeMonitor_(self.monitor)
-            self.monitor = None
+            m, self.monitor = self.monitor, None
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(m)
+            except Exception:
+                pass
         if self.panel.isVisible():
             self.panel.orderOut_(None)
             self.last_hidden_at = time.monotonic()
 
     def load(self, base):
         from Foundation import NSURL, NSURLRequest
+        url = NSURL.URLWithString_(compact_url(base, self.token_fn()))
+        if url is None:
+            self.show_offline()
+            return
         self.loaded_base = base
-        req = NSURLRequest.requestWithURL_(NSURL.URLWithString_(compact_url(base, self.token_fn())))
-        self.web.loadRequest_(req)
+        self.web.loadRequest_(NSURLRequest.requestWithURL_(url))
+
+    def retry(self):
+        self.load(self.base_fn())
 
     def show_offline(self):
         self.loaded_base = None  # reload from the server next time
@@ -374,11 +554,41 @@ class QuickPanel:
         self.panel.invalidateShadow()
 
     # -- web view callbacks
-    def on_navigate(self, url):
-        d = nav_decision(url, self.loaded_base or self.base_fn())
+    def on_provisional(self, webview):
+        """Navigation policy without a decisionHandler: stop anything that isn't this server's page."""
+        url = webview.URL()
+        s = str(url.absoluteString()) if url is not None else ""
+        d = nav_decision(s, self.loaded_base or self.base_fn())
+        if d == "allow":
+            return
+        webview.stopLoading()   # the page that was showing stays; didFailProvisional reports "cancelled" (ignored)
         if d == "external":
-            self.hooks["open_url"](url)
-        return d == "allow"
+            self.hooks["open_url"](s)
+
+    def on_loaded(self):
+        self.panel.invalidateShadow()
+        if self.first_show_pending:
+            self.first_show_pending = False
+            cb = self.hooks.get("panel_ok")
+            if cb:
+                cb()
+
+    def on_load_failed(self, error, provisional=True):
+        code = error.code() if error is not None else 0
+        if code == NAV_CANCELLED:
+            return
+        if provisional:
+            self.show_offline()
+        else:
+            _log("page failed to load: %s" % (error.localizedDescription() if error is not None else "unknown error"))
+
+    def on_web_process_ended(self):
+        self.loaded_base = None   # reload on the next show
+        if self.panel.isVisible():
+            self.retry()
+
+    def on_message_obj(self, message):
+        self.on_message(message.body())
 
     def on_message(self, body):
         msg = parse_message(body)
@@ -402,13 +612,14 @@ class QuickPanel:
             self.hooks["start_server"]()
             self._retry_later(2.5)
         elif action == "retry":
-            self.load(self.base_fn())
+            self.retry()
 
     def _retry_later(self, seconds):
-        from Foundation import NSTimer
-        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(seconds, False, lambda t: self.load(self.base_fn()))
+        # performSelector:afterDelay: runs on the main run loop and needs no block.
+        self.bridge.performSelector_withObject_afterDelay_("retryLoad:", None, float(seconds))
 
-    # -- optional global hotkey (off by default; macOS asks for Accessibility/Input Monitoring permission)
+    # -- optional global hotkey (off by default). The global key monitor only receives events once the user
+    # allows Slothmore under Privacy & Security > Accessibility; without that it is silently inactive.
     def _install_hotkey(self, hotkey):
         from AppKit import NSEvent
 
@@ -421,15 +632,23 @@ class QuickPanel:
                 self.toggle_from_hotkey()
                 return None
             return e
-        mask = 1 << 10  # NSEventMaskKeyDown
-        self.hotkey_monitors = [NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, on_global),
-                                NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, on_local)]
+
+        g = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(KEY_DOWN_MASK, _guarded("hotkey", on_global))
+        local = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(KEY_DOWN_MASK, _local_guard(on_local))
+        self.hotkey_monitors = [m for m in (g, local) if m is not None]
 
     def toggle_from_hotkey(self):
         if self.panel.isVisible():
             self.hide()
         else:
             self.show()
+
+
+def _local_guard(fn):
+    """A local event monitor must return the event (or None to swallow it); on error, pass the event through."""
+    def wrapper(e):
+        return _guard("hotkey", fn, e, default=e)
+    return wrapper
 
 
 def attach(status_item, base_fn, token_fn, hooks, hotkey=None):
