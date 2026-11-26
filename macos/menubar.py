@@ -19,12 +19,27 @@ DEFAULT_URL = os.environ.get("SLOTHMORE_URL") or os.environ.get("LAUNCHER_URL") 
 MAX_STOPPED = 20  # stopped items listed under "Start"
 
 
+def read_token():
+    """The dashboard's access token (written by the server to ~/.slothmore/token, mode 0600)."""
+    home = os.environ.get("SLOTHMORE_HOME") or os.environ.get("LAUNCHER_HOME") or os.path.expanduser("~/.slothmore")
+    try:
+        with open(os.path.join(home, "token")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 class Client:
-    def __init__(self, base):
+    def __init__(self, base, token=None):
         self.base = base.rstrip("/")
+        self.token = token
 
     def call(self, path, method="GET"):
-        req = urllib.request.Request(self.base + path, method=method, headers={"Origin": self.base})
+        tok = self.token or read_token()  # re-read so `slothmore --reset-token` is picked up
+        headers = {"Origin": self.base}
+        if tok:
+            headers["Authorization"] = "Bearer " + tok
+        req = urllib.request.Request(self.base + path, method=method, headers=headers)
         if method == "POST":
             req.data = b"{}"
             req.add_header("Content-Type", "application/json")
@@ -86,10 +101,12 @@ def build_model(listing):
 
 def open_dashboard(base):
     # Prefer the installed web app (Dock app named "Slothmore", then a leftover "Launcher"); fall back to the default browser.
+    # The installed web app keeps its sign-in cookie; the browser gets the token once in the URL.
     for app in ("Slothmore", "Launcher"):
         if subprocess.call(["open", "-a", app], stderr=subprocess.DEVNULL) == 0:
             return
-    subprocess.call(["open", base])
+    tok = read_token()
+    subprocess.call(["open", base.rstrip("/") + "/" + ("?token=" + tok if tok else "")])
 
 
 def make_app(rumps, client):

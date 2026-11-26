@@ -98,7 +98,7 @@ install() {
   # plistlib writes valid XML even for paths with spaces or odd characters.
   # The PATH from this shell is saved so npm, node and Homebrew tools work under launchd too.
   # Prefer bin/slothmore when present so --version / --no-open stay consistent with the CLI.
-  "$python" - "$SERVER_PLIST" "$SERVER_LABEL" "$APP_DIR" "$python" "$PATH" "$LOG_DIR/slothmore.log" "$port" ${folders[@]+"${folders[@]}"} <<'PY'
+  "$python" - "$SERVER_PLIST" "$SERVER_LABEL" "$APP_DIR" "$python" "$PATH" "$LOG_DIR/service.log" "$port" ${folders[@]+"${folders[@]}"} <<'PY'
 import os, plistlib, sys
 plist_path, label, d, py, path, log, port, *watch = sys.argv[1:]
 cli = os.path.join(d, "bin", "slothmore")
@@ -130,7 +130,7 @@ PY
 
   lctl bootout "gui/$UID_NUM/$SERVER_LABEL" 2>/dev/null || true
   lctl bootstrap "gui/$UID_NUM" "$SERVER_PLIST"
-  echo "Server login item installed: http://127.0.0.1:$port (log: $LOG_DIR/slothmore.log)"
+  echo "Server login item installed: http://127.0.0.1:$port (log: $LOG_DIR/service.log)"
 
   if [ "$with_menubar" = "1" ]; then
     "$menubar_python" - "$MENUBAR_PLIST" "$MENUBAR_LABEL" "$MACOS_DIR" "$menubar_python" "$PATH" "$LOG_DIR/menubar.log" "$port" <<'PY'
@@ -156,7 +156,7 @@ PY
     lctl bootstrap "gui/$UID_NUM" "$MENUBAR_PLIST"
     echo "Menu bar helper installed (log: $LOG_DIR/menubar.log)"
   fi
-  echo "Next: open http://127.0.0.1:$port in Chrome and use 'Install Slothmore', or in Safari use File > Add to Dock."
+  echo "Next: run '$APP_DIR/bin/slothmore open' (or 'slothmore open') to open it signed in, then use 'Install Slothmore' in Chrome or File > Add to Dock in Safari."
 }
 
 cmd="${1:-}"
