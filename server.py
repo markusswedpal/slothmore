@@ -12,7 +12,10 @@ import codecs
 import collections
 import fcntl
 import hashlib
+import hmac
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import mimetypes
 import os
 import pty
@@ -41,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
@@ -71,6 +74,175 @@ CONFIG_PATH = HOME_DIR / "config.json"
 IGNORED = {"node_modules", "__pycache__"}
 MAX_CHARS = 400000
 LOGS_DIR = HOME_DIR / "logs"
+TOKEN_PATH = HOME_DIR / "token"
+STATE_PATH = HOME_DIR / "server.json"
+LOG_PATH = HOME_DIR / "slothmore.log"
+LOG = logging.getLogger("slothmore")
+_ACTIVE_TOKEN = None          # current access token; never written to the log
+_SECRET_VALUES = set()        # env values (and the token) stripped from log lines
+COOKIE_NAME = "slothmore_token"
+COOKIE_MAX_AGE = 400 * 24 * 3600   # long-lived so an installed PWA stays signed in
+MAX_BODY = 1000000
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; "
+       "img-src 'self' data: https:; font-src 'self'; connect-src 'self'; manifest-src 'self'; "
+       "worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
+
+def _chmod(path, mode):
+    try:
+        os.chmod(str(path), mode)
+    except OSError:
+        LOG.debug("could not chmod %s to %o", path, mode, exc_info=True)
+
+
+def private_open(path, mode="w"):
+    """Open a text file that only the current user can read (0600), creating it if needed."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC)
+    fd = os.open(str(path), flags, 0o600)
+    _chmod(path, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8", errors="replace", buffering=1)
+
+
+def _remember_secret(value):
+    """Remember a secret so it is stripped from later log lines (skips very short values)."""
+    s = str(value or "")
+    if len(s) >= 6:
+        _SECRET_VALUES.add(s)
+
+
+def _redact(text):
+    """Remove the access token, cookie/Bearer values, and known env values from a log line."""
+    s = str(text)
+    tok = _ACTIVE_TOKEN
+    if tok:
+        s = s.replace(tok, "[redacted]")
+    for secret in list(_SECRET_VALUES):
+        if secret and secret in s:
+            s = s.replace(secret, "[redacted]")
+    s = re.sub(r"([?&]token=)[^\s&]+", r"\1[redacted]", s, flags=re.I)
+    s = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-]+", r"\1[redacted]", s, flags=re.I)
+    s = re.sub(r"(" + re.escape(COOKIE_NAME) + r"=)[^;\s]+", r"\1[redacted]", s)
+    return s
+
+
+def _refresh_secret_values(cfg=None):
+    """Track env values currently in the config so they never appear in the log."""
+    try:
+        if cfg is None:
+            cfg = load_config()
+        for prefs in (cfg.get("prefs") or {}).values():
+            env = prefs.get("env") if isinstance(prefs, dict) else None
+            if isinstance(env, dict):
+                for v in env.values():
+                    _remember_secret(v)
+    except Exception:
+        LOG.debug("could not refresh redacted env values", exc_info=True)
+
+
+class _RedactFormatter(logging.Formatter):
+    def format(self, record):
+        return _redact(super().format(record))
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that keeps the log and its backups at 0600."""
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(self.baseFilename, flags, 0o600)
+        _chmod(self.baseFilename, 0o600)
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
+
+    def doRollover(self):
+        super().doRollover()
+        _chmod(self.baseFilename, 0o600)
+        for i in range(1, self.backupCount + 1):
+            bak = "%s.%d" % (self.baseFilename, i)
+            if os.path.exists(bak):
+                _chmod(bak, 0o600)
+
+
+def setup_logging(level=None, interactive=None):
+    """Log to ~/.slothmore/slothmore.log (rotating, 1 MB x 3, 0600) and to stderr when interactive.
+
+    Level comes from `level`, then SLOTHMORE_LOG_LEVEL, then INFO. Safe to call more than once.
+    """
+    raw = (level or os.environ.get("SLOTHMORE_LOG_LEVEL") or "info")
+    name = str(raw).upper()
+    if name not in logging._nameToLevel or name == "NOTSET":
+        name = "INFO"
+    LOG.handlers.clear()
+    LOG.setLevel(getattr(logging, name))
+    LOG.propagate = False
+    fmt = _RedactFormatter("%(asctime)s %(levelname)s %(message)s")
+    try:
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        _chmod(HOME_DIR, 0o700)
+        fh = _PrivateRotatingFileHandler(str(LOG_PATH), maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        LOG.addHandler(fh)
+    except OSError as e:
+        sys.stderr.write("Slothmore: could not open log file %s (%s)\n" % (LOG_PATH, e))
+    if interactive is None:
+        interactive = sys.stderr.isatty() and not os.environ.get("SLOTHMORE_SERVICE")
+    if interactive:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        LOG.addHandler(sh)
+
+
+def private_write(path, data):
+    """Write bytes or text to path with 0600 permissions (atomic replace)."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    tmp = Path(str(path) + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    _chmod(tmp, 0o600)
+    os.replace(str(tmp), str(path))
+
+
+def ensure_private_dirs():
+    """~/.slothmore is 0700; config, token and logs are 0600 (also fixes files from older versions)."""
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    _chmod(HOME_DIR, 0o700)
+    for root, dirs, files in os.walk(str(HOME_DIR)):
+        for d in dirs:
+            _chmod(os.path.join(root, d), 0o700)
+        for f in files:
+            fp = os.path.join(root, f)
+            if not os.path.islink(fp):
+                _chmod(fp, 0o600)
+
+
+def load_token(reset=False, create=True):
+    """Return the access token from ~/.slothmore/token, creating it if missing (or if reset)."""
+    global _ACTIVE_TOKEN
+    if not reset:
+        try:
+            tok = TOKEN_PATH.read_text().strip()
+            if re.match(r"^[A-Za-z0-9_\-]{32,128}$", tok):
+                _chmod(TOKEN_PATH, 0o600)
+                _ACTIVE_TOKEN = tok
+                _remember_secret(tok)
+                return tok
+        except OSError:
+            LOG.debug("could not read token file", exc_info=True)
+    if not create:
+        return None
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    _chmod(HOME_DIR, 0o700)
+    tok = secrets.token_urlsafe(32)
+    private_write(TOKEN_PATH, tok + "\n")
+    _ACTIVE_TOKEN = tok
+    _remember_secret(tok)
+    return tok
+
+
+def dashboard_url(port, token=None):
+    base = "http://127.0.0.1:%d/" % port
+    return base + ("?token=" + quote(token) if token else "")
 LOG_MAX_LINES = 2000          # per stored run log (ring buffer, oldest lines dropped)
 LOG_MAX_BYTES = 512 * 1024    # per stored run log
 HISTORY_KEEP = 25             # runs kept per item; older logs are deleted
@@ -191,10 +363,10 @@ def load_config():
 
 def save_config(cfg):
     HOME_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2))
-    os.replace(str(tmp), str(CONFIG_PATH))
+    _chmod(HOME_DIR, 0o700)
+    private_write(CONFIG_PATH, json.dumps(cfg, indent=2))
     SCAN_CACHE.update(key=None, items=None)
+    _refresh_secret_values(cfg)
 
 
 # --------------------------------------------------------------------------- detection
@@ -461,13 +633,14 @@ def detect(path, prefs=None):
     try:
         sig = _ai_signals(p)
     except Exception:
+        LOG.debug("folder signature failed for %s", path, exc_info=True)
         sig = None
     info = _detect_base(p, prefs, sig)
     if sig is not None:
         try:
             _ai_annotate(info, p, sig, prefs)
         except Exception:
-            pass
+            LOG.debug("AI annotation failed for %s", p, exc_info=True)
     return info
 
 
@@ -570,6 +743,7 @@ def _detect_base(path, prefs=None, sig=None):
         try:
             ai = _detect_ai(path, info, prefs, sig)
         except Exception:
+            LOG.debug("AI project detection failed for %s", path, exc_info=True)
             ai = None
         if ai:
             return ai
@@ -1507,7 +1681,9 @@ def readme_payload(it):
         "size": meta["size"],
         "format": fmt,
         "text": text,
-        "can_open": IS_MAC,
+        "can_open": _can_open_readme(meta["name"]),
+        "can_reveal": _can_reveal_readme(),
+        "platform": "mac" if IS_MAC else ("linux" if sys.platform.startswith("linux") else sys.platform),
     }
 
 
@@ -1542,25 +1718,74 @@ def readme_asset(it, rel):
     return data, ctype
 
 
+# README files that Open may hand to a text editor / xdg-open. An extensionless
+# README is still shown in the viewer, but is never passed to the OS "open" so a
+# hostile executable named README cannot be launched.
+README_OPEN_EXTS = (".md", ".markdown", ".rst", ".txt")
+
+
+def _readme_text_extension(name):
+    lower = (name or "").lower()
+    return any(lower.endswith(ext) for ext in README_OPEN_EXTS)
+
+
+def _can_reveal_readme():
+    if IS_MAC:
+        return bool(shutil.which("open") or os.path.exists("/usr/bin/open"))
+    return bool(shutil.which("xdg-open"))
+
+
+def _can_open_readme(name):
+    if IS_MAC:
+        return _can_reveal_readme()
+    return bool(shutil.which("xdg-open")) and _readme_text_extension(name)
+
+
+def _spawn_no_shell(args):
+    """Start a helper process from an argv list. Never uses a shell."""
+    try:
+        subprocess.Popen(list(args), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, shell=False)
+    except OSError:
+        raise ApiError(500, "could not open the file")
+
+
 def open_readme(it, mode="reveal"):
-    """Open or reveal the README with the OS. macOS only (open / open -R)."""
+    """Reveal the README's folder, or open the file in a text editor.
+
+    On macOS, Open uses `open -t` (always a text editor), never plain `open`, so an
+    extensionless executable README cannot launch in Terminal. Reveal uses `open -R`.
+    On Linux, Open uses `xdg-open` only for known text extensions; otherwise it is
+    refused. Reveal opens the containing folder. Arguments are always an argv list.
+    """
     meta = readme_meta(it["path"])
     if not meta:
         raise ApiError(404, "no readme")
-    if not IS_MAC:
-        raise ApiError(501, "Show in Finder is available on macOS.", path=tilde(meta["path"]))
     mode = str(mode or "reveal")
-    if mode == "open":
-        args = ["open", meta["path"]]
-    elif mode == "reveal":
-        args = ["open", "-R", meta["path"]]
-    else:
+    if mode not in ("open", "reveal"):
         raise ApiError(400, "unknown mode")
-    try:
-        subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        raise ApiError(500, "could not open the file")
-    return {"ok": True, "mode": mode, "path": tilde(meta["path"])}
+    path, folder = meta["path"], meta["folder"]
+    if IS_MAC:
+        opener = shutil.which("open") or ("/usr/bin/open" if os.path.exists("/usr/bin/open") else None)
+        if not opener:
+            raise ApiError(500, "could not open the file")
+        args = [opener, "-t", path] if mode == "open" else [opener, "-R", path]
+        _spawn_no_shell(args)
+        return {"ok": True, "mode": mode, "path": tilde(path)}
+    opener = shutil.which("xdg-open")
+    if not opener:
+        raise ApiError(501, "Opening files from the dashboard needs xdg-open.", path=tilde(path))
+    if mode == "reveal":
+        _spawn_no_shell([opener, folder])
+        return {"ok": True, "mode": mode, "path": tilde(path), "folder": tilde(folder)}
+    if not _readme_text_extension(meta["name"]):
+        raise ApiError(
+            409,
+            "This README has no text extension, so it isn't opened as a file. Use Show in folder instead.",
+            path=tilde(path), folder=tilde(folder),
+        )
+    _spawn_no_shell([opener, path])
+    return {"ok": True, "mode": mode, "path": tilde(path)}
 
 
 
@@ -1611,7 +1836,7 @@ def public(it, cfg=None):
     raw_presets = prefs.get("presets") if isinstance(prefs.get("presets"), dict) else {}
     presets = [{"name": str(k), "args": str(v)} for k, v in raw_presets.items()]
     raw_env = prefs.get("env") if isinstance(prefs.get("env"), dict) else {}
-    env_vars = [{"key": str(k), "value": str(v)} for k, v in raw_env.items()]
+    env_vars = [{"key": str(k), "has_value": str(v) != ""} for k, v in raw_env.items()]  # values only via /env
     supports_args = bool((it["cmd"] or it.get("needs_choice")) and not it.get("static"))
     custom = str(prefs.get("label") or "").strip() or None
     d = {
@@ -1804,7 +2029,7 @@ class Run:
             if self.log_bytes > 2 * LOG_MAX_BYTES:
                 self.log_fh.close()
                 _trim_log(self.log_path)
-                self.log_fh = open(str(self.log_path), "a", encoding="utf-8", errors="replace", buffering=1)
+                self.log_fh = private_open(self.log_path, "a")
                 self.log_bytes = self.log_path.stat().st_size
         except (OSError, ValueError):
             self.log_fh = None
@@ -1900,7 +2125,7 @@ def _delayed_crash_restart(run, delay, attempt):
             carry_chunks=list(run.chunks),
         )
     except Exception:
-        pass
+        LOG.exception("auto-restart after crash failed for %s", run.item_id)
 
 
 def _reader(run):
@@ -1952,14 +2177,19 @@ def _reader(run):
                     ).start()
 
 
-def _parse_env_text(text):
+def _parse_env_text(text, keep=None):
+    """KEY=VALUE lines. A bare KEY line keeps the stored value from `keep` (used when values were never revealed)."""
     out = {}
+    keep = keep or {}
     for idx, raw_line in enumerate(str(text).splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[7:].strip()
+        if "=" not in line and line in keep:
+            out[line] = str(keep[line])
+            continue
         if "=" not in line:
             raise ApiError(400, "Env line %d must be KEY=VALUE" % idx)
         k, v = line.split("=", 1)
@@ -2010,14 +2240,19 @@ def update_prefs(it, body):
             pname = str(body["delete_preset"]).strip()
             if isinstance(prefs.get("presets"), dict):
                 prefs["presets"].pop(pname, None)
+        old_env = prefs.get("env") if isinstance(prefs.get("env"), dict) else {}
         if "env_text" in body and body["env_text"] is not None:
-            prefs["env"] = _parse_env_text(body["env_text"])
+            prefs["env"] = _parse_env_text(body["env_text"], old_env)
         elif "env" in body and isinstance(body["env"], dict):
             cleaned = {}
             for k, v in body["env"].items():
                 ks = str(k).strip()
                 if not ENV_KEY_RE.match(ks):
                     raise ApiError(400, "Invalid env variable name: %s" % ks)
+                if v is None:  # null = keep the stored value (the client never saw it)
+                    if ks in old_env:
+                        cleaned[ks] = str(old_env[ks])
+                    continue
                 vs = str(v)
                 if "\0" in vs:
                     raise ApiError(400, "Invalid null byte in env value for %s" % ks)
@@ -2321,7 +2556,7 @@ def _watch_loop():
                             restarting_ids.discard(item_id_key)
                     threading.Thread(target=_do_watch_restart, daemon=True).start()
         except Exception:
-            pass
+            LOG.exception("file-watch loop error")
 
 
 # --------------------------------------------------------------------------- logs and run history
@@ -2356,11 +2591,10 @@ def _save_history(iid):
         d = _item_log_dir(iid)
         try:
             d.mkdir(parents=True, exist_ok=True)
-            tmp = d / "history.json.tmp"
-            tmp.write_text(json.dumps(HISTORY.get(iid, []), indent=1), encoding="utf-8")
-            os.replace(str(tmp), str(d / "history.json"))
+            _chmod(d, 0o700)
+            private_write(d / "history.json", json.dumps(HISTORY.get(iid, []), indent=1))
         except OSError:
-            pass
+            LOG.warning("could not save history for %s", iid, exc_info=True)
 
 
 def _trim_log(path):
@@ -2379,9 +2613,7 @@ def _trim_log(path):
         lines = lines[-LOG_MAX_LINES:]
     out = b"[... older output trimmed ...]\n" + b"\n".join(lines)
     try:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(out)
-        os.replace(str(tmp), str(path))
+        private_write(path, out)
     except OSError:
         pass
 
@@ -2394,7 +2626,8 @@ def _open_history(run, banner=None):
     try:
         d.mkdir(parents=True, exist_ok=True)
         run.log_path = d / (run_id + ".log")
-        run.log_fh = open(str(run.log_path), "w", encoding="utf-8", errors="replace", buffering=1)
+        _chmod(d, 0o700)
+        run.log_fh = private_open(run.log_path, "w")
         if banner:
             run.log_fh.write(banner.lstrip("\n"))
     except OSError:
@@ -2639,6 +2872,7 @@ def _maybe_notify(run, kind, title, body):
             return None
         return push_event(run.item_id, run.name, kind, title, body)
     except Exception:
+        LOG.debug("notification failed", exc_info=True)
         return None
 
 
@@ -2734,7 +2968,7 @@ def sample_health():
                 run.health = _sample_psutil(run)
                 continue
         except Exception:
-            pass
+            LOG.debug("psutil health sample failed", exc_info=True)
         if table is None:
             table = _ps_table()
         pids = _tree_pids(run.proc.pid, table)
@@ -2774,7 +3008,7 @@ def port_owner(port):
                 if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN and c.pid:
                     return {"pid": c.pid, "command": psutil.Process(c.pid).name()}
         except Exception:
-            pass  # macOS needs root for net_connections; fall through to lsof
+            LOG.debug("psutil net_connections unavailable, falling back to lsof", exc_info=True)
     lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
     if lsof:
         try:
@@ -2840,7 +3074,7 @@ def _monitor_loop():
             if tick % 2 == 0:
                 sample_health()
         except Exception:
-            pass
+            LOG.exception("monitor loop error")
 
 
 # --------------------------------------------------------------------------- groups (stacks)
@@ -3270,6 +3504,7 @@ def _http_get(port, path, timeout=0.6, limit=2000000):
     except urllib.error.HTTPError as e:
         return e.code, b""
     except Exception:
+        LOG.debug("HTTP probe of 127.0.0.1:%s%s failed", port, path, exc_info=True)
         return None, None
 
 
@@ -3413,6 +3648,7 @@ def _probe_port(port, keys):
             try:
                 r = PROBES[k](port)
             except Exception:
+                LOG.debug("probe %s on port %s failed", k, port, exc_info=True)
                 r = None
             if r:
                 return r
@@ -3450,7 +3686,7 @@ def _proc_stats(pid, table, etimes=None):
             up = max(0.0, time.time() - root.create_time())
             return _cpu_delta(pid, cpu_s, up, rss, len(procs) - 1)
         except Exception:
-            pass
+            LOG.debug("psutil process stats failed for pid %s", pid, exc_info=True)
     pids = _tree_pids(pid, table)
     if not pids:
         return None
@@ -3474,6 +3710,88 @@ def _cpu_delta(pid, cpu_s, up, rss, children):
 
 def _ai_run_id(key):
     return hashlib.sha1(("ai-server:" + key).encode()).hexdigest()[:10]
+
+
+def process_identity(pid):
+    """Best-effort {pid, command, started_at} for a live process, or None if it is gone.
+
+    started_at is the process start time as a Unix timestamp when it can be read
+    (psutil, Linux /proc, or `ps`). Used to detect PID reuse before sending a signal.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    ident = {"pid": pid, "command": None, "started_at": None}
+    if psutil is not None:
+        try:
+            p = psutil.Process(pid)
+            ident["command"] = p.name() or None
+            ident["started_at"] = p.create_time()
+            return ident
+        except Exception:
+            LOG.debug("psutil process identity failed for pid %s", pid, exc_info=True)
+    try:
+        ident["command"] = Path("/proc/%d/comm" % pid).read_text().strip() or None
+        raw = Path("/proc/%d/stat" % pid).read_text()
+        fields = raw[raw.rfind(")") + 1:].split()
+        startticks = int(fields[19])
+        clk = float(os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100)
+        boot = None
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                boot = int(line.split()[1])
+                break
+        if boot is not None:
+            ident["started_at"] = boot + startticks / clk
+        if ident["command"] or ident["started_at"] is not None:
+            return ident
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "etime=", "-o", "comm="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, check=False,
+        ).stdout.decode("utf-8", "replace").strip()
+        if out:
+            parts = out.split(None, 1)
+            ident["started_at"] = time.time() - _parse_cputime(parts[0])
+            if len(parts) > 1:
+                ident["command"] = ident["command"] or parts[1].strip() or None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return ident if ident["command"] or ident["started_at"] is not None else ident
+
+
+def fresh_port_identity(port):
+    """Who is listening on `port` right now (bypasses the owner cache)."""
+    AI_OWNER_CACHE.pop(port, None)
+    owner = port_owner(port) or {}
+    pid = owner.get("pid")
+    if not pid:
+        return None
+    ident = process_identity(pid) or {"pid": int(pid), "command": None, "started_at": None}
+    if not ident.get("command") and owner.get("command"):
+        ident["command"] = owner["command"]
+    return ident
+
+
+def _identities_match(old, new):
+    """True if new is the same process as old (same PID, and command/start time when both known)."""
+    if not old or not new:
+        return False
+    if int(old["pid"]) != int(new["pid"]):
+        return False
+    oc = os.path.basename(str(old.get("command") or "")).lower()
+    nc = os.path.basename(str(new.get("command") or "")).lower()
+    if oc and nc and oc != nc:
+        return False
+    a, b = old.get("started_at"), new.get("started_at")
+    if a is not None and b is not None and abs(float(a) - float(b)) > 1.5:
+        return False
+    return True
 
 
 def _ai_cli(key):
@@ -3541,6 +3859,12 @@ def probe_model_servers(cfg=None):
         ours = bool(run and run.alive)
         owner = _owner_cached(port) or {}
         pid = owner.get("pid")
+        ident = process_identity(pid) if pid else None
+        if ident and not ident.get("command") and owner.get("command"):
+            ident["command"] = owner["command"]
+        st = AI_PORT_STATE.get(port) or {}
+        st["identity"] = ident
+        AI_PORT_STATE[port] = st
         stats = _proc_stats(pid, table, etimes) if pid else None
         guard = bool(owner.get("command") and AI_FOREIGN_GUARD_RE.search(owner["command"]))
         models = r.get("models") or []
@@ -3641,7 +3965,7 @@ def _cwds(pids):
                 out[pid] = psutil.Process(pid).cwd()
                 continue
             except Exception:
-                pass
+                LOG.debug("psutil cwd failed for pid %s", pid, exc_info=True)
         try:
             out[pid] = os.readlink("/proc/%d/cwd" % pid)
         except OSError:
@@ -3791,6 +4115,57 @@ def ai_server_start(key):
     return run
 
 
+def _ai_server_stop_foreign(m, key, port):
+    """Stop a model server Slothmore did not start, after a fresh check of port, process and probe.
+
+    Re-probes the HTTP signature, re-resolves the listening PID, and (when we recorded
+    one earlier) confirms it is the same process by PID, command and start time. If
+    anything has changed, refuses rather than signalling a different process.
+    """
+    prev = (AI_PORT_STATE.get(port) or {}).get("identity")
+    try:
+        fresh = _probe_port(port, [key])
+    except Exception:
+        LOG.warning("re-probe of port %s failed before stop", port, exc_info=True)
+        fresh = None
+    if not fresh or fresh.get("key") != key:
+        raise ApiError(409, "%s is no longer running on port %d. Refresh and try again." % (m["name"], port))
+    ident = fresh_port_identity(port)
+    if not ident or not ident.get("pid"):
+        raise ApiError(409, "Couldn't find the process listening on port %d." % port)
+    if prev and not _identities_match(prev, ident):
+        raise ApiError(
+            409,
+            "The process on port %d has changed (it is no longer the same %s process). Refresh and try again."
+            % (port, m["name"]),
+        )
+    cmd = ident.get("command")
+    if cmd and AI_FOREIGN_GUARD_RE.search(cmd):
+        raise ApiError(409, "Port %d belongs to %s; stop the container or VM there." % (port, cmd))
+    cli = _ai_cli(key)
+    if m.get("stop") and cli:
+        try:
+            res = subprocess.run([cli] + m["stop"][1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 timeout=15, shell=False)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise ApiError(500, "Could not run %s: %s" % (" ".join(m["stop"]), e))
+        AI_PORT_STATE.pop(port, None)
+        AI_OWNER_CACHE.pop(port, None)
+        AI_CACHE.update(at=0.0, data=None)
+        return {"stopped": "cli", "output": res.stdout.decode("utf-8", "replace")[-2000:], "pid": ident["pid"]}
+    pid = ident["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise ApiError(403, "Not allowed to stop PID %d (owned by another user)." % pid)
+    AI_PORT_STATE.pop(port, None)
+    AI_OWNER_CACHE.pop(port, None)
+    AI_CACHE.update(at=0.0, data=None)
+    return {"stopped": "signal", "pid": pid}
+
+
 def ai_server_stop(key, port, confirm):
     m = MODEL_SERVER_BY_KEY.get(key)
     if not m:
@@ -3802,33 +4177,7 @@ def ai_server_stop(key, port, confirm):
         return {"stopped": "ours"}
     if not confirm:
         raise ApiError(409, "confirm_required", detail="%s wasn't started by Slothmore." % m["name"])
-    st = AI_PORT_STATE.get(port) or {}
-    if not (st.get("result") and st["result"].get("key") == key):
-        raise ApiError(409, "%s isn't detected on port %d any more." % (m["name"], port))
-    cli = _ai_cli(key)
-    if m.get("stop") and cli:
-        try:
-            res = subprocess.run([cli] + m["stop"][1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
-        except (OSError, subprocess.SubprocessError) as e:
-            raise ApiError(500, "Could not run %s: %s" % (" ".join(m["stop"]), e))
-        AI_CACHE.update(at=0.0, data=None)
-        return {"stopped": "cli", "output": res.stdout.decode("utf-8", "replace")[-2000:]}
-    owner = port_owner(port) or {}
-    pid = owner.get("pid")
-    if not pid:
-        raise ApiError(409, "Couldn't find the process listening on port %d." % port)
-    if owner.get("command") and AI_FOREIGN_GUARD_RE.search(owner["command"]):
-        raise ApiError(409, "Port %d belongs to %s; stop the container or VM there." % (port, owner["command"]))
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        raise ApiError(403, "Not allowed to stop PID %d (owned by another user)." % pid)
-    AI_PORT_STATE.pop(port, None)
-    AI_OWNER_CACHE.pop(port, None)
-    AI_CACHE.update(at=0.0, data=None)
-    return {"stopped": "signal", "pid": pid}
+    return _ai_server_stop_foreign(m, key, port)
 
 
 def ai_agent_stop(pid, confirm):
@@ -3867,23 +4216,93 @@ def ai_agent_stop(pid, confirm):
     return {"stopped": True, "pid": pid}
 
 
+def sse_poll(run, idx, timeout=15):
+    """Wait for the next SSE payload. Returns (new_idx, kind, payload).
+
+    kind is 'chunks' (payload is a list of texts), 'ping', or 'exit' (payload is the exit code).
+    The condition lock is released before this returns, so the caller can write to a socket safely.
+    """
+    with run.cond:
+        if idx < run.base:
+            idx = run.base
+        pending = list(run.chunks[idx - run.base:])
+        if pending:
+            return idx + len(pending), "chunks", pending
+        if not run.alive:
+            return idx, "exit", run.exit_code
+        run.cond.wait(timeout)
+        pending = list(run.chunks[idx - run.base:])
+        if pending:
+            return idx + len(pending), "chunks", pending
+        if not run.alive:
+            return idx, "exit", run.exit_code
+        return idx, "ping", None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Slothmore"
+    timeout = 60  # a client that promises a body and never sends it can't hold a thread forever
 
     def log_message(self, fmt, *args):
-        pass
+        try:
+            LOG.debug("%s", fmt % args if args else fmt)
+        except Exception:
+            LOG.debug("access log failed", exc_info=True)
+
+    def _internal_error(self, exc):
+        # Log the traceback; never send it (or the token) to the client.
+        LOG.exception("internal error while handling %s %s", self.command, urlparse(self.path).path)
+        self._send(500, {"error": "internal error"})
 
     # -- plumbing
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _security_headers(self):
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         if not isinstance(body, bytes):
             body = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self._security_headers()
+        for k, v in (headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    # -- auth: token in ~/.slothmore/token, sent as a cookie (browser) or Bearer header (CLI, menu bar)
+    def _token_ok(self, candidate):
+        tok = getattr(self.server, "token", None)
+        return bool(tok and candidate) and hmac.compare_digest(str(candidate).encode(), tok.encode())
+
+    def _authed(self):
+        auth = self.headers.get("Authorization") or ""
+        if auth[:7].lower() == "bearer " and self._token_ok(auth[7:].strip()):
+            return True
+        raw = self.headers.get("Cookie")
+        if raw:
+            for part in raw.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == COOKIE_NAME and self._token_ok(v.strip()):
+                    return True
+        return False
+
+    def _cookie_header(self):
+        return ("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d"
+                % (COOKIE_NAME, self.server.token, COOKIE_MAX_AGE))
+
+    def _login_page(self, code=401, bad_token=False):
+        try:
+            html = (STATIC / "login.html").read_text(encoding="utf-8")
+        except OSError:
+            html = "<!doctype html><title>Slothmore</title><p>Run <code>slothmore open</code> to sign in.</p>"
+        html = html.replace("{{ERROR}}", "That token is not valid. Run <code>slothmore open</code> again."
+                            if bad_token else "")
+        self._send(code, html.encode("utf-8"), "text/html; charset=utf-8")
 
     def _guard(self, write):
         """Reject DNS rebinding (Host) and cross-site requests (Origin, Sec-Fetch-Site)."""
@@ -3903,12 +4322,19 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0:
+        raw = (self.headers.get("Content-Length") or "").strip()
+        if not raw:
             return {}
+        if not raw.isdigit():
+            raise ApiError(400, "bad Content-Length")
+        n = int(raw)
+        if n == 0:
+            return {}
+        if n > MAX_BODY:
+            raise ApiError(413, "request body too large")
         try:
-            data = json.loads(self.rfile.read(min(n, 1000000)))
-        except ValueError:
+            data = json.loads(self.rfile.read(n))
+        except (ValueError, UnicodeDecodeError):
             raise ApiError(400, "bad json")
         return data if isinstance(data, dict) else {}
 
@@ -3918,7 +4344,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         u = urlparse(self.path)
         parts = [p for p in u.path.split("/") if p]
+        is_api = u.path.startswith("/api/")
+        q_all = parse_qs(u.query, keep_blank_values=True)
+        if not is_api and "token" in q_all:
+            # Jupyter-style sign-in: trade ?token= for an HttpOnly cookie, then strip it from the URL.
+            if not self._token_ok((q_all.get("token") or [""])[0]):
+                return self._login_page(401, bad_token=True)
+            rest = [(k, v) for k, vs in q_all.items() if k != "token" for v in vs]
+            loc = u.path + ("?" + "&".join("%s=%s" % (quote(k), quote(v)) for k, v in rest) if rest else "")
+            return self._send(302, b"", "text/plain; charset=utf-8",
+                              headers=[self._cookie_header(), ("Location", loc or "/")])
+        if is_api and not self._authed():
+            return self._send(401, {"error": "unauthorized",
+                                    "detail": "Open Slothmore with `slothmore open` to sign in."})
+        if u.path in ("/", "/index.html") and not self._authed():
+            return self._login_page(401)
         try:
+            if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "env":
+                if not ITEM_ID_RE.match(parts[2]):
+                    raise ApiError(404, "unknown item")
+                it = find_item(parts[2])
+                if not it:
+                    raise ApiError(404, "unknown item")
+                prefs = (load_config().get("prefs") or {}).get(it["id"]) or {}
+                env = prefs.get("env") if isinstance(prefs.get("env"), dict) else {}
+                return self._send(200, {"env": {str(k): str(v) for k, v in env.items()}})
             if u.path == "/api/items":
                 return self._send(200, self._listing())
             if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "stream":
@@ -3943,6 +4393,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, settings_public())
             if u.path == "/api/ai":
                 return self._send(200, ai_state(force=(parse_qs(u.query).get("force") or ["0"])[0] == "1"))
+            if u.path == "/api/ports":
+                return self._send(200, {"ports": list_listening_ports(own_port=self.server.server_address[1])})
             if u.path == "/api/health":
                 return self._send(200, {"items": [
                     {"id": iid, "name": r.name, "pid": r.proc.pid if r.proc else None, "started_at": r.started_at,
@@ -3968,6 +4420,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._static(u.path)
         except ApiError as e:
             self._send(e.status, e.payload)
+        except Exception as e:
+            self._internal_error(e)
 
     def _listing(self):
         cfg = load_config()
@@ -4013,38 +4467,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        self._security_headers()
         self.end_headers()
         try:
             while True:
-                with run.cond:
-                    if idx < run.base:
-                        idx = run.base
-                    pending = run.chunks[idx - run.base:]
-                    if not pending:
-                        if not run.alive:
-                            self.wfile.write(
-                                ("event: exit\ndata: %s\n\n" % json.dumps({"code": run.exit_code})).encode()
-                            )
-                            self.wfile.flush()
-                            return
-                        run.cond.wait(15)
-                        if idx - run.base >= len(run.chunks):
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                        continue
-                for text in pending:
-                    idx += 1
-                    self.wfile.write(
-                        ("id: %d\ndata: %s\n\n" % (idx, json.dumps({"t": text}))).encode()
-                    )
+                idx, kind, payload = sse_poll(run, idx, 15)
+                if kind == "exit":
+                    self.wfile.write(("event: exit\ndata: %s\n\n" % json.dumps({"code": payload})).encode())
+                    self.wfile.flush()
+                    return
+                if kind == "ping":
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                start = idx - len(payload)
+                for i, text in enumerate(payload):
+                    ev_id = start + i + 1
+                    self.wfile.write(("id: %d\ndata: %s\n\n" % (ev_id, json.dumps({"t": text}))).encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("SSE client disconnected", exc_info=True)
             return
 
     # -- POST
     def do_POST(self):
         if not self._guard(True):
             return
+        if not self._authed():
+            return self._send(401, {"error": "unauthorized",
+                                    "detail": "Open Slothmore with `slothmore open` to sign in."})
         u = urlparse(self.path)
         parts = [p for p in u.path.split("/") if p]
         try:
@@ -4108,6 +4559,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ApiError(404, "unknown action")
                 self._send(200, self._listing())
+            elif u.path == "/api/ports/stop":
+                res = stop_listening_port(
+                    body.get("port"), body.get("pid"), body.get("confirm") is True,
+                    own_port=self.server.server_address[1],
+                )
+                self._send(200, res)
             elif u.path == "/api/pick":
                 picked = pick_folder()
                 if body.get("mode") == "watch":
@@ -4120,7 +4577,7 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             self._send(e.status, e.payload)
         except Exception as e:  # keep the server alive on unexpected errors
-            self._send(500, {"error": "server error: %s" % e})
+            self._internal_error(e)
 
     def _item_action(self, iid, action, body):
         it = find_item(iid)
@@ -4155,10 +4612,446 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, public(find_item(iid) or it))
 
 
+
+# --------------------------------------------------------------------------- listening ports (Ports view)
+
+LIKELY_HTTP_PORTS = {
+    80, 81, 443, 3000, 3001, 4000, 4173, 5000, 5173, 8000, 8001, 8080, 8081,
+    8443, 8888, 9000, 9443, 10443, 11434, 1234, 1337, 7860, 8188, 8787, 7777,
+}
+LIKELY_HTTP_CMDS = {
+    "node", "nodejs", "python", "python3", "uvicorn", "gunicorn", "hypercorn",
+    "ruby", "puma", "rackup", "php", "nginx", "caddy", "httpd", "apache2",
+    "deno", "bun", "next", "vite", "java", "caddy", "traefik", "code-server",
+    "grafana", "streamlit", "gradio", "jupyter", "jupyter-lab", "jupyter-labtop",
+    "ollama", "comfyui", "lm-studio", "lms",
+}
+PORTS_IDENTITY = {}  # (port, pid) -> identity from the last list, used by Stop
+
+
+def _split_host_port(name):
+    """Parse an lsof/ss local address into (host, port) or (None, None)."""
+    raw = re.sub(r"\s+\(.*\)$", "", str(name or "").strip())
+    if not raw:
+        return None, None
+    if raw.startswith("[") and "]" in raw:
+        br = raw.find("]")
+        host, rest = raw[1:br], raw[br + 1:]
+        if rest.startswith(":"):
+            try:
+                return _norm_addr(host), int(rest[1:])
+            except ValueError:
+                return None, None
+        return None, None
+    if ":" not in raw:
+        return None, None
+    host, _, port = raw.rpartition(":")
+    try:
+        return _norm_addr(host or "*"), int(port)
+    except ValueError:
+        return None, None
+
+
+def _norm_addr(host):
+    h = (host or "*").strip()
+    if h in ("*", "0.0.0.0", "::", "[::]", "::0"):
+        return "*"
+    if h.startswith("::ffff:"):
+        return h[7:]
+    return h
+
+
+def parse_lsof_listen(text):
+    """Parse `lsof -nP -iTCP -sTCP:LISTEN -Fpcun` into raw listen records."""
+    recs, cur = [], None
+
+    def flush():
+        if not cur:
+            return
+        for port, addr in cur["listens"]:
+            recs.append({
+                "pid": cur["pid"], "command": cur["command"], "user": cur["user"],
+                "uid": cur["uid"], "port": port, "address": addr,
+            })
+
+    for line in str(text or "").splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            flush()
+            try:
+                cur = {"pid": int(val), "command": None, "user": None, "uid": None, "listens": []}
+            except ValueError:
+                cur = None
+        elif cur is None:
+            continue
+        elif tag == "c":
+            cur["command"] = val or None
+        elif tag == "u":
+            cur["user"] = val or None
+            if val and val.isdigit():
+                cur["uid"] = int(val)
+        elif tag == "n":
+            host, port = _split_host_port(val)
+            if port:
+                cur["listens"].append((port, host))
+    flush()
+    return recs
+
+
+_SS_USERS_RE = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
+_SS_ADDR_RE = re.compile(r"(\[?[0-9A-Fa-f:\.*]+\]?:\d+)")
+
+
+def parse_ss_listen(text):
+    """Parse `ss -ltnpH` into the same raw listen records as parse_lsof_listen."""
+    recs = []
+    for line in str(text or "").splitlines():
+        addrs = _SS_ADDR_RE.findall(line)
+        if not addrs:
+            continue
+        host, port = _split_host_port(addrs[0])
+        if not port:
+            continue
+        m = _SS_USERS_RE.search(line)
+        recs.append({
+            "pid": int(m.group(2)) if m else None,
+            "command": (m.group(1).rstrip(".") if m else None),
+            "user": None, "uid": None, "port": port, "address": host,
+        })
+    return recs
+
+
+def _collect_listen_records():
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    if lsof:
+        try:
+            out = subprocess.run(
+                [lsof, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcun"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=False, shell=False,
+            ).stdout.decode("utf-8", "replace")
+            recs = parse_lsof_listen(out)
+            if recs:
+                return recs
+        except (OSError, subprocess.SubprocessError) as e:
+            LOG.debug("lsof listen listing failed: %s", e, exc_info=True)
+    ss = shutil.which("ss")
+    if ss:
+        try:
+            out = subprocess.run(
+                [ss, "-ltnpH"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=False, shell=False,
+            ).stdout.decode("utf-8", "replace")
+            return parse_ss_listen(out)
+        except (OSError, subprocess.SubprocessError) as e:
+            LOG.debug("ss listen listing failed: %s", e, exc_info=True)
+    LOG.warning("No lsof or ss available to list listening ports")
+    return []
+
+
+def _pid_uid(pid):
+    if not pid:
+        return None
+    if psutil is not None:
+        try:
+            return psutil.Process(int(pid)).uids().real
+        except Exception:
+            LOG.debug("psutil uid failed for pid %s", pid, exc_info=True)
+    try:
+        return Path("/proc/%d" % int(pid)).stat().st_uid
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "uid="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, check=False, shell=False,
+        ).stdout.decode().strip()
+        return int(out) if out.isdigit() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _pid_user(uid, fallback=None):
+    if fallback and not (fallback.isdigit() if isinstance(fallback, str) else False):
+        return fallback
+    if uid is None:
+        return fallback
+    try:
+        import pwd
+        return pwd.getpwuid(int(uid)).pw_name
+    except Exception:
+        return fallback or str(uid)
+
+
+def _run_for_pid_or_port(pid, port):
+    for run in list(RUNS.values()):
+        if not run.alive:
+            continue
+        if port and run.port == port:
+            return run
+        if pid and run.proc and run.proc.pid == pid:
+            return run
+    return None
+
+
+def _project_for_listen(pid, port, cwd, cfg):
+    run = _run_for_pid_or_port(pid, port)
+    if run:
+        folder = None
+        try:
+            it = find_item(run.item_id)
+            if it and it.get("path"):
+                folder = tilde(it["path"])
+        except Exception:
+            LOG.debug("could not resolve project for run %s", run.item_id, exc_info=True)
+        if not folder and cwd:
+            folder = tilde(cwd)
+        return folder, run.item_id, run.name
+    if not cwd:
+        return None, None, None
+    cwd_abs = os.path.abspath(cwd)
+    best = None
+    for root in list(cfg.get("watch") or []) + list(cfg.get("pinned") or []):
+        r = expand(root)
+        if not os.path.isdir(r):
+            continue
+        r = os.path.abspath(r)
+        if cwd_abs == r or cwd_abs.startswith(r + os.sep):
+            if best is None or len(r) > len(best):
+                best = r
+    if best:
+        return tilde(cwd_abs), None, None
+    return None, None, None
+
+
+def _addr_rank(addr):
+    if addr in ("*", "0.0.0.0", "::"):
+        return 0
+    if addr in ("127.0.0.1", "::1"):
+        return 1
+    return 2
+
+
+def _listen_url(port, addresses):
+    addrs = addresses or ["127.0.0.1"]
+    if "*" in addrs or "0.0.0.0" in addrs or "127.0.0.1" in addrs:
+        host = "127.0.0.1"
+    elif "::" in addrs or "::1" in addrs:
+        host = "[::1]"
+    else:
+        a = addrs[0]
+        host = ("[%s]" % a) if ":" in a else a
+    return "http://%s:%d" % (host, port)
+
+
+def list_listening_ports(own_port=None):
+    """Every TCP LISTEN socket, enriched for the Ports view. Never uses a shell."""
+    cfg = load_config()
+    recs = _collect_listen_records()
+    grouped = {}
+    for r in recs:
+        key = (r["port"], r.get("pid"))
+        g = grouped.setdefault(key, {
+            "port": r["port"], "pid": r.get("pid"), "command": r.get("command"),
+            "user": r.get("user"), "uid": r.get("uid"), "addresses": [],
+        })
+        if r.get("address") and r["address"] not in g["addresses"]:
+            g["addresses"].append(r["address"])
+        if r.get("command") and not g["command"]:
+            g["command"] = r["command"]
+        if r.get("user") and not g["user"]:
+            g["user"] = r["user"]
+        if r.get("uid") is not None and g["uid"] is None:
+            g["uid"] = r["uid"]
+    pids = [g["pid"] for g in grouped.values() if g["pid"]]
+    cwds = _cwds(pids) if pids else {}
+    me = os.getuid()
+    out = []
+    PORTS_IDENTITY.clear()
+    for g in grouped.values():
+        pid, port = g["pid"], g["port"]
+        if g["uid"] is None and pid:
+            g["uid"] = _pid_uid(pid)
+        g["user"] = _pid_user(g["uid"], g.get("user"))
+        addrs = sorted(g["addresses"] or ["*"], key=_addr_rank)
+        display = addrs[0]
+        if display == "*":
+            display = "0.0.0.0"
+        folder, item_id, item_name = _project_for_listen(pid, port, cwds.get(pid), cfg)
+        cmd = g.get("command") or ""
+        base = os.path.basename(cmd).lower()
+        http = bool(
+            port in LIKELY_HTTP_PORTS
+            or base in LIKELY_HTTP_CMDS
+            or any(base.startswith(c) for c in ("python", "node", "next-"))
+        )
+        if item_id:
+            run = RUNS.get(item_id)
+            if run and (run.detected_web if hasattr(run, "detected_web") else False):
+                http = True
+        ident = process_identity(pid) if pid else None
+        if ident:
+            if not ident.get("command") and cmd:
+                ident["command"] = cmd
+            PORTS_IDENTITY[(port, pid)] = ident
+        ours = bool(own_port and port == own_port)
+        owned = bool(pid and g["uid"] is not None and g["uid"] == me)
+        foreign = bool(cmd and AI_FOREIGN_GUARD_RE.search(cmd))
+        can_stop = bool(owned and pid and pid != 1 and not ours and not foreign)
+        out.append({
+            "port": port,
+            "address": display,
+            "addresses": addrs,
+            "pid": pid,
+            "command": cmd or None,
+            "user": g["user"],
+            "uid": g["uid"],
+            "folder": folder,
+            "item_id": item_id,
+            "item_name": item_name,
+            "ours": ours,
+            "owned": owned,
+            "can_stop": can_stop,
+            "http": http,
+            "url": _listen_url(port, addrs) if http else None,
+            "started_at": ident.get("started_at") if ident else None,
+        })
+    out.sort(key=lambda x: (x["port"], x["pid"] or 0, x["address"]))
+    return out
+
+
+def stop_listening_port(port, pid, confirm, own_port=None):
+    """Stop the process listening on port, after a fresh identity check (finding 7)."""
+    try:
+        port = int(port)
+        pid = int(pid)
+    except (TypeError, ValueError):
+        raise ApiError(400, "port and pid are required")
+    if own_port and port == int(own_port):
+        raise ApiError(409, "That's the Slothmore dashboard itself; stop it from Terminal or with brew services.")
+    if pid <= 1:
+        raise ApiError(403, "Won't signal PID %d." % pid)
+    if not confirm:
+        raise ApiError(409, "confirm_required", detail="Stop the process on port %d (PID %d)?" % (port, pid))
+    uid = _pid_uid(pid)
+    if uid is None or uid != os.getuid():
+        raise ApiError(403, "Can only stop processes owned by you.")
+    ident = fresh_port_identity(port)
+    if not ident or not ident.get("pid"):
+        raise ApiError(409, "Couldn't find the process listening on port %d. Refresh and try again." % port)
+    if int(ident["pid"]) != pid:
+        raise ApiError(409, "Port %d is no longer PID %d. Refresh and try again." % (port, pid))
+    prev = PORTS_IDENTITY.get((port, pid))
+    if prev and not _identities_match(prev, ident):
+        raise ApiError(409, "The process on port %d has changed. Refresh and try again." % port)
+    # Even without a cached identity, require the live process still to be the port owner
+    live = process_identity(pid)
+    if live and not _identities_match(ident, live):
+        raise ApiError(409, "The process on port %d has changed. Refresh and try again." % port)
+    cmd = ident.get("command") or (live or {}).get("command") or ""
+    if cmd and AI_FOREIGN_GUARD_RE.search(cmd):
+        raise ApiError(409, "Port %d belongs to %s; stop the container or VM there." % (port, cmd))
+    run = _run_for_pid_or_port(pid, port)
+    if run and run.alive:
+        stop_run(run)
+        PORTS_IDENTITY.pop((port, pid), None)
+        LOG.info("stopped Slothmore-started process on port %d (pid %d)", port, pid)
+        return {"stopped": "ours", "pid": pid, "port": port}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise ApiError(403, "Not allowed to stop PID %d (owned by another user)." % pid)
+    PORTS_IDENTITY.pop((port, pid), None)
+    LOG.info("sent SIGTERM to pid %d on port %d", pid, port)
+    return {"stopped": "signal", "pid": pid, "port": port}
+
+
+def make_server(port, token):
+
+    """Bind 127.0.0.1:port (0 = any free port) and attach the auth token and allowed Host/Origin values."""
+    global _ACTIVE_TOKEN
+    if token:
+        _ACTIVE_TOKEN = token
+        _remember_secret(token)
+    if not LOG.handlers:
+        setup_logging(interactive=False)
+    _refresh_secret_values()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    actual = server.server_address[1]
+    server.allowed_hosts = {"127.0.0.1:%d" % actual, "localhost:%d" % actual}
+    server.allowed_origins = {"http://" + h for h in server.allowed_hosts}
+    server.token = token
+    return server
+
+
+def _probe(port, token):
+    """'ours' if a Slothmore with this token answers on port, 'other' if something else does, None if nothing."""
+    req = urllib.request.Request("http://127.0.0.1:%d/api/settings" % port,
+                                 headers={"Authorization": "Bearer " + (token or "")})
+    try:
+        with urllib.request.urlopen(req, timeout=2) as r:
+            return "ours" if r.status == 200 else "other"
+    except urllib.error.HTTPError:
+        return "other"
+    except (OSError, ValueError):
+        return None
+
+
+def _state_port():
+    try:
+        return int(json.loads(STATE_PATH.read_text()).get("port"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _open_url(url):
+    try:
+        import webbrowser
+        return webbrowser.open(url)
+    except Exception:
+        LOG.warning("could not open the browser", exc_info=True)
+        return False
+
+
+def cmd_open(argv, print_only=False):
+    """`slothmore open` / `slothmore url`: sign in to an already running server (for example brew services)."""
+    ap = argparse.ArgumentParser(prog="slothmore " + ("url" if print_only else "open"),
+                                 description="Print the signed-in dashboard address." if print_only
+                                 else "Open the running dashboard in your browser, signed in.")
+    ap.add_argument("--port", type=int, default=None)
+    args = ap.parse_args(argv)
+    port = args.port or _state_port() or int(os.environ.get("SLOTHMORE_PORT") or DEFAULT_PORT)
+    token = load_token(create=False)
+    if not token:
+        sys.exit("No token yet in %s. Start Slothmore first: `slothmore` or `brew services start slothmore`."
+                 % TOKEN_PATH)
+    state = _probe(port, token)
+    if state is None:
+        sys.exit("Nothing is answering on 127.0.0.1:%d. Start it with `slothmore` or `brew services start slothmore`."
+                 % port)
+    if state == "other":
+        sys.exit("Port %d is used by another program (or a Slothmore with a different token). "
+                 "Try `slothmore open --port <port>`." % port)
+    url = dashboard_url(port, token)
+    print(url)
+    if not print_only:
+        _open_url(url)
+    return 0
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("open", "url"):
+        return cmd_open(argv[1:], print_only=argv[0] == "url")
     ap = argparse.ArgumentParser(
         prog="slothmore",
         description="Slothmore: a local dashboard that starts web servers and runs scripts from folders.",
+        epilog="Subcommands: `slothmore open` opens a running dashboard signed in; "
+               "`slothmore url` prints its signed-in address.",
     )
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument(
@@ -4169,8 +5062,18 @@ def main(argv=None):
     ap.add_argument("--watch", action="append", default=[], help="folder whose subfolders to list")
     ap.add_argument("--open", dest="open_browser", action="store_true", help="open the dashboard in a browser")
     ap.add_argument("--no-open", dest="open_browser", action="store_false", help="do not open a browser")
+    ap.add_argument("--reset-token", action="store_true",
+                    help="make a new access token (signs out browsers and installed web apps)")
+    ap.add_argument("--log-level", default=None, choices=["debug", "info", "warning", "error", "critical"],
+                    help="log level (or set SLOTHMORE_LOG_LEVEL). Default: info")
     ap.set_defaults(open_browser=None)
     args = ap.parse_args(argv)
+
+    ensure_private_dirs()
+    setup_logging(level=args.log_level)
+    token = load_token(reset=args.reset_token)
+    if args.reset_token:
+        print("New access token written to %s." % TOKEN_PATH, flush=True)
 
     for w in args.watch:
         w = expand(w)
@@ -4179,13 +5082,26 @@ def main(argv=None):
         else:
             print("Not a folder, skipping: %s" % w, file=sys.stderr)
 
+    open_browser = args.open_browser
+    if open_browser is None:
+        open_browser = sys.stdout.isatty() and not os.environ.get("SLOTHMORE_SERVICE")
+
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server = make_server(args.port, token)
     except OSError as e:
-        sys.exit("Could not listen on 127.0.0.1:%d (%s). Is it already running?" % (args.port, e))
-    server.daemon_threads = True
-    server.allowed_hosts = {"127.0.0.1:%d" % args.port, "localhost:%d" % args.port}
-    server.allowed_origins = {"http://" + h for h in server.allowed_hosts}
+        if _probe(args.port, token) == "ours" and not args.reset_token:
+            url = dashboard_url(args.port, token)
+            print("Slothmore is already running: %s" % url, flush=True)
+            if open_browser:
+                _open_url(url)
+            return 0
+        sys.exit("Could not listen on 127.0.0.1:%d (%s). Another program uses this port; "
+                 "try `slothmore --port 7788`." % (args.port, e))
+    port = server.server_address[1]
+    try:
+        private_write(STATE_PATH, json.dumps({"port": port, "pid": os.getpid(), "version": __version__}))
+    except OSError:
+        LOG.warning("could not write %s", STATE_PATH, exc_info=True)
 
     def on_term(signum, frame):
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -4195,28 +5111,32 @@ def main(argv=None):
     threading.Thread(target=_watch_loop, daemon=True).start()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
-    open_browser = args.open_browser
-    if open_browser is None:
-        open_browser = sys.stdout.isatty() and not os.environ.get("SLOTHMORE_SERVICE")
+    url = dashboard_url(port, token)
     if open_browser:
         def _open_browser():
             time.sleep(0.4)
-            try:
-                import webbrowser
-                webbrowser.open("http://127.0.0.1:%d" % args.port)
-            except Exception:
-                pass
+            _open_url(url)
         threading.Thread(target=_open_browser, daemon=True).start()
 
-    print("Slothmore running at http://127.0.0.1:%d  (Ctrl+C to quit)" % args.port, flush=True)
+    LOG.info("Slothmore %s listening on 127.0.0.1:%d", __version__, port)
+    if sys.stdout.isatty():
+        print("Slothmore running at %s  (Ctrl+C to quit)" % url, flush=True)
+    else:  # keep the token out of service logs
+        print("Slothmore running at http://127.0.0.1:%d/  (run `slothmore open` to sign in)" % port, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        LOG.info("stopped")
     finally:
         stop_all()
         server.server_close()
+        try:
+            if json.loads(STATE_PATH.read_text()).get("pid") == os.getpid():
+                STATE_PATH.unlink()
+        except (OSError, ValueError, AttributeError):
+            LOG.debug("could not remove stale server.json", exc_info=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

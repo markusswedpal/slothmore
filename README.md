@@ -11,13 +11,38 @@ brew install markusswedpal/tap/slothmore
 slothmore
 ```
 
-That starts the dashboard at http://127.0.0.1:7777 and opens it in your browser. To start it at login and keep it running:
+That starts the dashboard at http://127.0.0.1:7777 and opens it in your browser, signed in. Keep the Terminal window open while you use it.
+
+To run it in the background and start it at login instead:
 
 ```
 brew services start slothmore
+slothmore open
 ```
 
-`slothmore --version` prints the version. `slothmore --port 8888` uses another port. `slothmore --no-open` starts the server without opening a browser. `slothmore --watch ~/Projects` adds a watched folder (you can also add folders later in the page with **Add** or **Watch a folder**).
+The service starts without a browser, so use `slothmore open` whenever you want the dashboard. It opens the running server signed in (see [Signing in](#signing-in)). If you run `slothmore` while it is already running, it opens the running one instead of failing.
+
+| Command | What it does |
+|---|---|
+| `slothmore` | start the dashboard and open it |
+| `slothmore open` | open an already running dashboard (for example the `brew services` one), signed in |
+| `slothmore url` | print the signed-in address |
+| `slothmore --port 8888` | use another port (`slothmore open --port 8888` to open it) |
+| `slothmore --no-open` | start without opening a browser |
+| `slothmore --watch ~/Projects` | add a watched folder (you can also add folders in the page with **Add** or **Watch a folder**) |
+| `slothmore --reset-token` | make a new access token, which signs out every browser and installed web app |
+| `slothmore --version` | print the version |
+
+## Signing in
+
+The dashboard can run commands on your machine, so it is protected by an access token, the same way Jupyter does it.
+
+- On first start Slothmore creates a random token in `~/.slothmore/token` (readable only by you). The same token is reused after restarts.
+- `slothmore` and `slothmore open` open `http://127.0.0.1:7777/?token=…`. The server checks the token, stores it in a cookie (HttpOnly, SameSite=Strict, valid for about a year) and redirects to `http://127.0.0.1:7777/` so the token is no longer in the address bar.
+- Every API request and the live output stream need that cookie, or an `Authorization: Bearer <token>` header (used by the menu bar helper).
+- A browser without the cookie gets a sign-in page. Run `slothmore open`, or paste the token from `~/.slothmore/token`.
+- The installed web app (Dock) keeps the cookie, so it keeps working after restarts. After `slothmore --reset-token`, open it once with `slothmore open` in the same browser.
+- When Slothmore runs as a service, the token is not written to the log. The log only shows the plain address.
 
 ## Run from source
 
@@ -25,7 +50,13 @@ brew services start slothmore
 python3 bin/slothmore
 ```
 
-Or `python3 server.py`. Open http://127.0.0.1:7777 if you used `--no-open`.
+Or `python3 server.py`. If you used `--no-open`, run `python3 bin/slothmore open` to open it signed in.
+
+Run the tests (standard library only; the README renderer checks also need Node):
+
+```
+python3 -m unittest discover -s tests -v
+```
 
 ## Install as an app (Dock)
 
@@ -46,7 +77,7 @@ macos/install-login-item.sh status                              # what is instal
 macos/install-login-item.sh uninstall                           # remove both (settings and logs stay)
 ```
 
-- **Server login item:** a launchd agent (`~/Library/LaunchAgents/com.slothmore.dashboard.plist`) that starts the server at login and keeps it running, so the Dock app always has something to open. It saves your shell's `PATH`, so `npm`, `node` and Homebrew tools work. Log: `~/.slothmore/slothmore.log`. Folders are optional; you can add more in the page.
+- **Server login item:** a launchd agent (`~/Library/LaunchAgents/com.slothmore.dashboard.plist`) that starts the server at login and keeps it running, so the Dock app always has something to open. It saves your shell's `PATH`, so `npm`, `node` and Homebrew tools work. Launchd stdout/stderr: `~/.slothmore/service.log`. The app also writes `~/.slothmore/slothmore.log`. Folders are optional; you can add more in the page.
 - **Menu bar icon** (`macos/menubar.py`, optional): shows `▸ 2` when two things are running (`▸ !` when the server can't be reached). The menu has **Open Slothmore**, each running item with **Open in browser**, **Restart** and **Stop**, your **Groups** (Start all / Restart all / Stop all) and a **Start** submenu (pinned items first). It needs one package:
 
   ```
@@ -127,7 +158,7 @@ Tip: if a script shows nothing until it finishes, run it with `python -u` (folde
 
 - **Auto-detected ports:** Slothmore watches each process's stdout/stderr (stripping ANSI escape codes) for actual listening URLs and ports—such as Vite's `Local: http://localhost:5173`, Next.js, Flask/uvicorn `Running on`, `http.server` `Serving HTTP on ... port N`, or generic `http://127.0.0.1:N` / `port N` lines—and updates the card, **Running now** row, and **Open** URL automatically (keeping any selected static `.html` page appended).
 - **Script arguments & named presets:** Cards for scripts and servers include an **Args** field (for example `-reset`). Click **+ Preset** next to Args to save named argument sets (such as `reset` or `dry`), switch between them from the **Preset** dropdown, or delete unused presets. Saved in `~/.slothmore/config.json`.
-- **Per-card environment variables:** Click **Env** on any startable card to open its `KEY=VALUE` editor. Keys are validated (`[A-Za-z_][A-Za-z0-9_]*`), values are merged into the child process environment at launch, masked by default (`••••••••`) with a **Reveal & Edit** toggle, and never printed in the terminal command header.
+- **Per-card environment variables:** Click **Env** on any startable card to open its `KEY=VALUE` editor. Keys are validated (`[A-Za-z_][A-Za-z0-9_]*`), values are merged into the child process environment at launch, masked by default (`••••••••`) with a **Reveal & Edit** toggle, and never printed in the terminal command header. The item list sent to the page contains only the key names. Values are loaded from the server when you click **Reveal & Edit** and dropped again when you mask or close the editor. When saving, a line with just `KEY` keeps the stored value.
 - **Static HTML folders:** Folders containing `*.html` files launch on a free local port. If there are multiple `.html` files, choose the entry page from the **Page** picker on the card; your choice is remembered and immediately updates the **Open** URL.
 - **Running now box:** Click any active item to select its card and view its output, click **Open** to launch a running web server, use **Restart** (`↻`) or **Stop**, or click a stopped/finished item to re-launch it.
 
@@ -139,6 +170,7 @@ Tip: if a script shows nothing until it finishes, run it with `python -u` (folde
 
 ## Logs and run history
 
+- The app writes its own log to `~/.slothmore/slothmore.log` (rotating, 1 MB × 3, mode 0600). Set `--log-level debug` or `SLOTHMORE_LOG_LEVEL=debug` for more detail. The token and stored env values never appear in the log. When you run it in a terminal, the same messages also go to stderr. The launchd login item writes its stdout/stderr to `~/.slothmore/service.log`, so it does not share the app log file.
 - Every run's output is saved under `~/.slothmore/logs/<item>/` (the last 2000 lines and at most 512 KB per run, older lines trimmed). Each item keeps its last 25 runs. History survives restarts of Slothmore; a run that was still going when Slothmore quit shows as **interrupted**.
 - Each run records its start and end time, duration, exit code, arguments, preset, what started it (you, a group, a restart or auto-restart) and its port. Environment variable values are never written to logs or history.
 - Click **History** on a card or above the output (or press `Shift+H`) to see past runs. **View log** shows that run's output with a yellow "Viewing past run" bar; **Back to live output** returns. **Clear history** (click twice) deletes the saved logs for that item.
@@ -162,13 +194,26 @@ Tip: if a script shows nothing until it finishes, run it with `python -u` (folde
 - While something runs, its card and the **Running now** row show CPU, memory, uptime and the number of processes, counting child processes too (for example the real server under `npm run dev`). CPU is a percentage of one core, so busy multi-threaded apps can go above 100%. Values update every 2 seconds. If `psutil` is installed it is used; otherwise Slothmore reads `ps` (no extra install needed).
 - Before starting, Slothmore checks the port the app is expected to use: the `port` in `slothmore.json` / `launcher.json`, or a port the app picked itself last time (for example Vite's 5173). If that port is already taken, nothing starts and a message shows what is using it (program and PID when available) and the `kill <PID>` command if you want to free it yourself. **Start anyway** starts it regardless. Slothmore never stops other programs for you. Apps that use the free port Slothmore gives them in `$PORT` are not checked, because that port is free by definition.
 
+### Listening ports
+
+Open **Machine → Ports** in the sidebar. The panel lists every TCP port in LISTEN on your machine: port, address (`127.0.0.1`, `0.0.0.0`, `::`, and so on), process name, PID, user, and the project folder when the process's working directory is in a watched or pinned folder, or when it is something Slothmore itself started. The list refreshes when you open it and about every 5 seconds while it is visible.
+
+- **Open** appears for ports that look like HTTP (common development ports and typical server process names) and opens `http://127.0.0.1:<port>` in a new tab (or `http://[::1]:<port>` when the socket is IPv6-only).
+- **Stop** appears only for processes you own, not for Slothmore's own dashboard port. It asks for confirmation, then re-checks the PID, command and start time just before sending SIGTERM, and refuses if anything has changed. Processes Slothmore started are stopped the usual way. Docker and VM helpers are not signalled; stop them there instead.
+- Filter the table with the search box. The row for Slothmore itself is marked.
+
+The listing uses `lsof -nP -iTCP -sTCP:LISTEN` on macOS, and `ss` if `lsof` is missing on Linux. It never runs a shell.
+
 ## README files
+
 
 - If a folder has a README at the top level, its card gets a **README** button. The same action appears in the ⌘K palette. Click it to read the file in the app.
 - Recognised names, case-insensitive: `README.md` (preferred), `README.markdown`, `README.rst`, `README.txt`, or `README` with no extension. Only the top-level file is used, not one in a subfolder. Files larger than 1 MB are listed but not opened.
 - For a pinned single file (for example `app.py`), Slothmore looks in the parent folder only when that folder looks like the file's project: it has a marker such as `package.json`, `slothmore.json`, `launcher.json`, `pyproject.toml` or a `.git` directory, or it is a small folder that already contains a README. Catch-all folders such as Desktop, Documents and Downloads are skipped.
 - Markdown is rendered in the app (headings, lists, code, tables, blockquotes, links and images). Raw HTML is shown as text, not executed. Links open in a new tab. Relative images are served only from that item's folder; path traversal and SVG files are rejected. `.rst`, `.txt` and bare README files are shown as plain text.
-- **View raw** shows the source, **Copy path** copies the file path, and on macOS **Show in Finder** and **Open** reveal or open the file with the default app (`open -R` / `open`). Esc closes the reader.
+- **Remote images** (`https://…`) are not loaded automatically. Each one shows a **Load image (host)** button, so opening a README never contacts another server until you click. Images are requested without a referrer. Plain `http://` images are shown as text.
+- Very large or deeply nested READMEs are cut short: rendering stops at 200 KB with a notice (**View raw** still shows the whole file), and blockquotes or lists nested more than 8 levels deep are shown as plain text.
+- **View raw** shows the source, **Copy path** copies the file path, and **Show in Finder** (or **Show in folder** on Linux) reveals the file. **Open** always uses a text editor (`open -t` on macOS; on Linux, `xdg-open` only for `.md`, `.markdown`, `.rst` and `.txt`). An extensionless README is never handed to the OS opener, so a hostile executable named `README` cannot launch. Esc closes the reader.
 
 ## AI
 
@@ -284,21 +329,43 @@ The dashboard is set entirely in **JetBrains Mono** (bundled, SIL Open Font Lice
 ## Security
 
 - The server listens on `127.0.0.1` only. Nothing on your network can reach it.
+- Every API request needs the access token (see [Signing in](#signing-in)).
 - It rejects requests with an unexpected `Host` header (blocks DNS rebinding) and any write request that doesn't come from the dashboard's own origin (blocks other websites from sending commands to it).
+- `~/.slothmore` is readable only by you (0700). The token, `config.json` (which holds env values), run logs and history are 0600, and permissions of older files are fixed at startup.
+- Every response sends a Content-Security-Policy:
+
+  ```
+  default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline';
+  img-src 'self' data: https:; font-src 'self'; connect-src 'self'; manifest-src 'self';
+  worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+  ```
+
+  Scripts and stylesheets load only from Slothmore itself, with no inline scripts and no inline event handlers. `style-src-attr 'unsafe-inline'` allows `style="…"` attributes, which the dashboard uses for layout; they can't run code. `img-src https:` is there for README images, but the README viewer only creates a remote `<img>` after you click **Load image**.
 - Even so, the dashboard can run commands in your folders, which is the point. Only watch or pin folders you trust, and never change `127.0.0.1` to `0.0.0.0`.
 
 ## Files
 
 ```
-bin/slothmore                 CLI entry point (`--version`, `--port`, `--open` / `--no-open`, `--watch`)
-server.py                     the server (API, process control, folder detection, history, health)
-static/                       the dashboard page, web app manifest, icons, fonts, markdown renderer
+bin/slothmore                 CLI entry point (`open`, `url`, `--version`, `--port`, `--no-open`, `--watch`, `--reset-token`, `--log-level`)
+server.py                     the server (API, auth, process control, folder detection, history, health)
+static/index.html             the dashboard page (markup only)
+static/app.js, app.css        dashboard script and styles
+static/login.html             sign-in page shown without the access cookie
+static/markdown.js            README renderer
+static/                       also the web app manifest, service worker, icons and fonts
+tests/                        unittest suite (`python3 -m unittest discover -s tests`)
+.github/workflows/test.yml    CI on Ubuntu and macOS, Python 3.12
 macos/install-login-item.sh   launchd login items (server, optional menu bar icon)
 macos/menubar.py              menu bar icon (needs rumps)
 install.sh, menubar.py        older entry points, forward to macos/
 LICENSE                       MIT, copyright 2026 Markus Wulff
+CHANGELOG.md                  release notes
 static/fonts/                 JetBrains Mono (SIL Open Font License 1.1) and notes
 ~/.slothmore/config.json      your settings (created on first run)
+~/.slothmore/token            access token (0600)
+~/.slothmore/server.json      port and PID of the running server (used by `slothmore open`)
+~/.slothmore/slothmore.log    app log (rotating, 1 MB × 3, 0600)
+~/.slothmore/service.log      launchd stdout/stderr (login item)
 ~/.slothmore/logs/            run logs and history
 ```
 
