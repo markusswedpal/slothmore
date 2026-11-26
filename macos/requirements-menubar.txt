@@ -1,0 +1,37 @@
+# Pinned, hash-checked packages for the macOS menu bar icon (installed into a private venv by the Homebrew formula).
+# Install:  pip install --no-deps --require-hashes --only-binary pyobjc-core,pyobjc-framework-Cocoa,pyobjc-framework-WebKit -r macos/requirements-menubar.txt
+# pyobjc ships universal2 wheels for every supported Python (3.11 to 3.15), so nothing is compiled; every wheel hash is listed so any of them is accepted.
+# pyobjc-framework-WebKit powers the quick panel (WKWebView); without it the icon shows the classic menu.
+# rumps is pure Python (source distribution only).
+pyobjc-core==13.1 \
+    --hash=sha256:5ac9595e3025dbcd6a048ea8e96719c0aee409afb16be48ac40e15e8fdabb438 \
+    --hash=sha256:0882594c79adee620a30dcb9ef370dcc2d40c43d5039aa44432b2d36b5af00ff \
+    --hash=sha256:1afdf8c1b153c34f21fe1ec55638752bc319e44cc323b56c3ff330e8e2b4b80c \
+    --hash=sha256:91dfc1f50fa16753817eeb6b7fbd5de1290e3ebfe1bbfce677fe914de8365122 \
+    --hash=sha256:46f7e1cbc9280c2ec6affb8d7ff463912c8f19b4718ae94add0f392340180125 \
+    --hash=sha256:b622a421f9a0b8d892dc38209e7ef590d2b4a9661885c7641486c71432df6a50 \
+    --hash=sha256:3eaf6cff348f9237ab6a8052aaae028390283ef9f5832edd3d69ef474b5de73a \
+    --hash=sha256:cdcabc26fbffa9b2266b52f451e87afff385171a9a164d6c6d7e3ab6390dcd5c
+
+pyobjc-framework-Cocoa==13.1 \
+    --hash=sha256:4af70d588f5b49bec29ee4b5252d14e401289d5d9928821c6fc387a108830f9a \
+    --hash=sha256:97c0be3d7142597a7d895fe5e79721e9d2500a472136c017f0cbf27b18d3dda1 \
+    --hash=sha256:a1c1de3cdb469d66a7514a4c038f41eb8410f8ae1bbaf5fc56a297cd1607bf7a \
+    --hash=sha256:1316e2863994355be6d57cf63a7f370484adcfb068610e69d1c3d2640d6c5e66 \
+    --hash=sha256:72f64c1990c424ccaa5ebc3014860220003b28269c41e35b0ad9f104e84baa43 \
+    --hash=sha256:18d3e550dcffd708169edc127d781e62957d5f02f6d3dde7759e9fd4ad5c7812 \
+    --hash=sha256:62094842ff8c139d9468b7278c8e49659beffd8b24f7743c542913b5222d45d0 \
+    --hash=sha256:4c30986901fa658a1160343993520a010dfbc44e35ab53ebb7852379d8c14ff1
+
+pyobjc-framework-WebKit==13.1 \
+    --hash=sha256:2a788b932e7f0ed2bd19b784b350c534d1d46ed63d1a07d41cd27491cc625784 \
+    --hash=sha256:8e3b7ad228dfe609b8d608d7c26512f1fd06333b3ce4e93453fd1d4b9c038b7a \
+    --hash=sha256:c3a013c9fc1062c82580b08775f6ad021471f75405793db7716d30d910ad9b3a \
+    --hash=sha256:05d6f3f8f6e729a073ed9baf5d5b44bfd8a626e7f6bbe171e1b9632735bb6f23 \
+    --hash=sha256:379585d2174a7a5d31eb573be895f5b8e92339844785603bec9c8fab9fccf4b7 \
+    --hash=sha256:000cac3b8dab85d7b134b3934713b8ad9e0e2a34ba935449fd88d5de31e55574 \
+    --hash=sha256:b91564aab899665ea70556bb9fe83c97df6cf3c7d85fb76600e67678bbca534b \
+    --hash=sha256:fbdfabc8309a232640bf59bde4cd924eb6153cf25e1bf188512fc6176c69eef2
+
+rumps==0.4.0 \
+    --hash=sha256:17fb33c21b54b1e25db0d71d1d793dc19dc3c0b7d8c79dc6d833d0cffc8b1596

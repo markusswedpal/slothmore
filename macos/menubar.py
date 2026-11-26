@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Slothmore menu bar helper for macOS (optional).
 
-Shows what is running (with CPU and memory), lets you open, restart or stop each item,
-start stopped items and groups, and opens the dashboard.
+Click the icon: a floating quick panel (the server's /compact page in a WKWebView) with search,
+running items, quick start, ports and AI models. Right-click or control-click: the classic menu, which
+shows what is running (with CPU and memory), lets you open, restart or stop each item, start stopped
+items and groups, and opens the dashboard. Without pyobjc-framework-WebKit (or with --classic) a click
+shows the classic menu.
 
-Needs one extra package:   python3 -m pip install --user rumps
-Run it by hand:            python3 macos/menubar.py [--url http://127.0.0.1:7777]
-Start it at every login:   macos/install-login-item.sh install --with-menubar
+Homebrew:                  `slothmore menubar` (rumps is installed by the formula)
+                           `slothmore menubar --install-login` starts it at every login
+From source:               python3 -m pip install --user rumps, then python3 macos/menubar.py
+                           or macos/install-login-item.sh install --with-menubar
+The dashboard port is read from ~/.slothmore/server.json; --url overrides it.
 """
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,29 +23,68 @@ import urllib.request
 
 DEFAULT_URL = os.environ.get("SLOTHMORE_URL") or os.environ.get("LAUNCHER_URL") or "http://127.0.0.1:7777"
 MAX_STOPPED = 20  # stopped items listed under "Start"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUMPS_HELP = ("The menu bar helper needs the Python package 'rumps'.\n"
+              "  Homebrew install:  brew reinstall markusswedpal/tap/slothmore   (0.2.1 or newer installs it)\n"
+              "  From source:       %s -m pip install --user rumps")
+
+
+def home_dir():
+    return os.environ.get("SLOTHMORE_HOME") or os.environ.get("LAUNCHER_HOME") or os.path.expanduser("~/.slothmore")
 
 
 def read_token():
     """The dashboard's access token (written by the server to ~/.slothmore/token, mode 0600)."""
-    home = os.environ.get("SLOTHMORE_HOME") or os.environ.get("LAUNCHER_HOME") or os.path.expanduser("~/.slothmore")
     try:
-        with open(os.path.join(home, "token")) as f:
+        with open(os.path.join(home_dir(), "token")) as f:
             return f.read().strip() or None
     except OSError:
         return None
 
 
+def read_port():
+    """Port of the running server, from ~/.slothmore/server.json (None when absent)."""
+    try:
+        with open(os.path.join(home_dir(), "server.json")) as f:
+            return int(json.load(f).get("port"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def server_command():
+    """argv that starts the dashboard server in the background (same install as this helper)."""
+    exe = os.environ.get("SLOTHMORE_BIN")
+    if exe and os.path.isfile(exe):
+        return [exe, "--no-open"]
+    return [sys.executable, os.path.join(ROOT, "bin", "slothmore"), "--no-open"]
+
+
+def start_server():
+    """Start the server detached from this helper. Returns the Popen (argv list, no shell)."""
+    return subprocess.Popen(server_command(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True, shell=False)
+
+
 class Client:
-    def __init__(self, base, token=None):
-        self.base = base.rstrip("/")
+    def __init__(self, base=None, token=None):
+        self._base = base.rstrip("/") if base else None
         self.token = token
+
+    @property
+    def base(self):
+        """Explicit --url, else the port in server.json (the server may have moved), else the default."""
+        if self._base:
+            return self._base
+        port = read_port()
+        return "http://127.0.0.1:%d" % port if port else DEFAULT_URL.rstrip("/")
 
     def call(self, path, method="GET"):
         tok = self.token or read_token()  # re-read so `slothmore --reset-token` is picked up
-        headers = {"Origin": self.base}
+        base = self.base
+        headers = {"Origin": base}
         if tok:
             headers["Authorization"] = "Bearer " + tok
-        req = urllib.request.Request(self.base + path, method=method, headers=headers)
+        req = urllib.request.Request(base + path, method=method, headers=headers)
         if method == "POST":
             req.data = b"{}"
             req.add_header("Content-Type", "application/json")
@@ -73,7 +118,7 @@ def build_model(listing):
     has a label and the actions it offers.
     """
     if listing is None:
-        return {"title": "▸ !", "online": False, "running": [], "stopped": [], "groups": []}
+        return {"title": "!", "online": False, "running": [], "stopped": [], "groups": []}
     items = listing.get("items") or []
     running, stopped = [], []
     for it in items:
@@ -95,7 +140,7 @@ def build_model(listing):
         groups.append({"id": g["id"], "label": "%s  (%d/%d)" % (g["name"], g.get("running", 0), g.get("total", 0)),
                        "actions": ["start", "restart", "stop"]})
     n = len(running)
-    return {"title": "▸ %d" % n if n else "▸", "online": True, "running": running,
+    return {"title": ("%d" % n) if n else "", "online": True, "running": running,
             "stopped": stopped[:MAX_STOPPED], "more": max(0, len(stopped) - MAX_STOPPED), "groups": groups}
 
 
@@ -109,12 +154,53 @@ def open_dashboard(base):
     subprocess.call(["open", base.rstrip("/") + "/" + ("?token=" + tok if tok else "")])
 
 
-def make_app(rumps, client):
+def load_quickpanel():
+    """macos/quickpanel.py, loaded by path (this file is itself loaded by path from `slothmore menubar`)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickpanel.py")
+    spec = importlib.util.spec_from_file_location("slothmore_quickpanel", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def open_url(url):
+    """Open an http(s) page in the default browser (argv list, no shell)."""
+    if str(url).startswith(("http://", "https://")):
+        subprocess.call(["open", url])
+
+
+def want_panel(classic=False, env=None):
+    env = os.environ if env is None else env
+    return not classic and env.get("SLOTHMORE_MENUBAR_CLASSIC", "") not in ("1", "true", "yes")
+
+
+def make_app(rumps, client, panel=True, hotkey=None):
     class SlothmoreMenu(rumps.App):
         def __init__(self):
-            super(SlothmoreMenu, self).__init__("▸", quit_button=None)
+            icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "menubarTemplate.png")
+            super(SlothmoreMenu, self).__init__(
+                "", icon=icon if os.path.isfile(icon) else None, template=True, quit_button=None)
             self.signature = None
+            self.quick = None
             self.refresh(None)
+            if panel:
+                rumps.events.before_start.register(self.attach_panel)
+
+        def attach_panel(self):
+            """Swap the menu click for the quick panel. Any failure keeps the classic menu."""
+            try:
+                qp = load_quickpanel()
+                if not qp.available():
+                    sys.stderr.write("Quick panel needs pyobjc-framework-WebKit; using the classic menu.\n")
+                    return
+                self.quick = qp.attach(
+                    self._nsapp.nsstatusitem, lambda: client.base, read_token,
+                    {"quit": lambda: rumps.quit_application(), "open_full": lambda: open_dashboard(client.base),
+                     "open_url": open_url, "start_server": start_server},
+                    hotkey=qp.parse_hotkey(hotkey) if hotkey else None)
+            except Exception as e:  # WebKit/pyobjc problem: the rumps menu still works
+                sys.stderr.write("Quick panel unavailable (%s: %s); using the classic menu.\n" % (type(e).__name__, e))
+                self.quick = None
 
         def _safe(self, fn):
             def cb(_sender):
@@ -126,6 +212,14 @@ def make_app(rumps, client):
                 self.refresh(None)
             return cb
 
+        def _start_server(self, _sender):
+            try:
+                start_server()
+                rumps.notification("Slothmore", "Starting", "The dashboard server is starting.")
+            except Exception as e:
+                rumps.notification("Slothmore", "Could not start", str(e)[:200])
+            self.signature = None
+
         def rebuild(self, model):
             sig = json.dumps(model, sort_keys=True)
             if sig == self.signature:
@@ -135,15 +229,15 @@ def make_app(rumps, client):
             self.menu.add(rumps.MenuItem("Open Slothmore", callback=lambda _: open_dashboard(client.base)))
             self.menu.add(rumps.separator)
             if not model["online"]:
-                self.menu.add(rumps.MenuItem("Slothmore server not reachable"))
+                self.menu.add(rumps.MenuItem("Slothmore is not running"))
+                self.menu.add(rumps.MenuItem("Start Slothmore", callback=self._start_server))
             else:
                 if not model["running"]:
                     self.menu.add(rumps.MenuItem("Nothing running"))
                 for r in model["running"]:
                     sub = rumps.MenuItem(r["label"])
                     if "open" in r["actions"]:
-                        sub.add(rumps.MenuItem("Open in browser", callback=self._safe(
-                            lambda u=r["url"]: subprocess.call(["open", u]))))
+                        sub.add(rumps.MenuItem("Open in browser", callback=self._safe(lambda u=r["url"]: open_url(u))))
                     sub.add(rumps.MenuItem("Restart", callback=self._safe(lambda i=r["id"]: client.item(i, "restart"))))
                     sub.add(rumps.MenuItem("Stop", callback=self._safe(lambda i=r["id"]: client.item(i, "stop"))))
                     self.menu.add(sub)
@@ -181,12 +275,21 @@ def make_app(rumps, client):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Slothmore menu bar helper (macOS)")
-    ap.add_argument("--url", default=DEFAULT_URL, help="dashboard address (default %(default)s)")
+    ap.add_argument("--url", default=None, help="dashboard address (default: port from ~/.slothmore/server.json, else %s)" % DEFAULT_URL)
+    ap.add_argument("--classic", action="store_true", help="click shows the classic menu, not the quick panel")
+    ap.add_argument("--hotkey", default=os.environ.get("SLOTHMORE_HOTKEY") or None,
+                    help="global shortcut for the quick panel, e.g. alt+space (off by default)")
     args = ap.parse_args(argv)
+    if args.hotkey:
+        try:
+            load_quickpanel().parse_hotkey(args.hotkey)
+        except ValueError as e:
+            sys.stderr.write("--hotkey: %s\n" % e)
+            return 2
     try:
         import rumps  # noqa: F401
     except ImportError:
-        sys.stderr.write("The menu bar helper needs rumps:  %s -m pip install --user rumps\n" % sys.executable)
+        sys.stderr.write(RUMPS_HELP % sys.executable + "\n")
         return 2
     if sys.platform != "darwin":
         sys.stderr.write("The menu bar helper only works on macOS.\n")
@@ -196,7 +299,7 @@ def main(argv=None):
         NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     except Exception:
         pass
-    make_app(rumps, Client(args.url)).run()
+    make_app(rumps, Client(args.url), panel=want_panel(args.classic), hotkey=args.hotkey).run()
     return 0
 
 
