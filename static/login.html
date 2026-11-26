@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slothmore · sign in</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<meta name="theme-color" content="#070B10">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="login-page">
+<main class="login-card">
+  <h1>Slothmore</h1>
+  <p>This dashboard can run commands on your Mac, so it needs your access token.</p>
+  <p>Open it signed in from Terminal:</p>
+  <pre><code>slothmore open</code></pre>
+  <p class="login-error">{{ERROR}}</p>
+  <form method="get" action="/" autocomplete="off">
+    <label for="token">Or paste the token from <code>~/.slothmore/token</code></label>
+    <div class="login-row"><input id="token" name="token" type="password" spellcheck="false" required><button class="btn primary" type="submit">Sign in</button></div>
+  </form>
+</main>
+</body>
+</html>

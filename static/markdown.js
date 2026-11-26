@@ -1,6 +1,8 @@
 /* A small Markdown renderer for the in-app README viewer.
    No dependencies. Raw HTML is escaped. javascript:/data: URLs are dropped.
-   Relative images are rewritten to a server endpoint; relative links are not navigable. */
+   Relative images are rewritten to a server endpoint; relative links are not navigable.
+   Remote (https) images become click-to-load buttons. Inline parsing is linear in the input
+   size; output is capped at 200 KB and nesting at 8 levels. */
 (function (root) {
   "use strict";
 
@@ -30,90 +32,140 @@
     return assetBase + encodeURIComponent(parts.join("/"));
   }
 
-  function inline(text, opts) {
+  var MAX_URL = 2048;
+
+  // Finds the next index of `needle` at or after `from`, remembering results so repeated
+  // lookups for unmatched markers stay linear instead of rescanning the rest of the text.
+  function finder(s) {
+    var memo = {};
+    return function (needle, from) {
+      var m = memo[needle];
+      if (m && m.from <= from && (m.idx === -1 || m.idx >= from)) return m.idx;
+      var idx = s.indexOf(needle, from);
+      memo[needle] = { from: from, idx: idx };
+      return idx;
+    };
+  }
+
+  var URL_PART = /^\s*<?([^)\s>]+)>?(?:\s+"([^"]*)")?\s*$/;
+
+  // [text](url "title") starting at s[open] === "[". Returns null or {text, url, title, end}.
+  function bracketLink(s, open, next, minText) {
+    var close = next("]", open + 1);
+    if (close === -1 || close - open - 1 < minText || s.charAt(close + 1) !== "(") return null;
+    var paren = next(")", close + 2);
+    if (paren === -1 || paren - close - 2 > MAX_URL + 256) return null;
+    var m = URL_PART.exec(s.slice(close + 2, paren));
+    if (!m || m[1].length > MAX_URL) return null;
+    return { text: s.slice(open + 1, close), url: m[1], title: m[2], end: paren + 1 };
+  }
+
+  var AUTOLINK = /<(https?:\/\/[^>\s]{1,2048})>/y;
+
+  function inline(text, opts, depth) {
+    depth = depth || 0;
+    var s = String(text == null ? "" : text);
+    if (depth > 6) return esc(s);
     var out = "";
     var i = 0;
-    var s = String(text == null ? "" : text);
-    function rest() { return s.slice(i); }
+    var next = finder(s);
 
     while (i < s.length) {
-      // backtick code (one or more backticks)
-      if (s.charAt(i) === "`") {
-        var m = rest().match(/^(`+)([^`]|[\s\S]*?)\1/);
-        if (m) {
-          out += "<code>" + esc(m[2]) + "</code>";
-          i += m[0].length;
+      var c = s.charAt(i);
+      // backtick code: a run of N backticks closed by the next run of N backticks
+      if (c === "`") {
+        var r = i;
+        while (s.charAt(r) === "`") r++;
+        var run = s.slice(i, r);
+        var endTick = next(run, r);
+        if (endTick !== -1) {
+          out += "<code>" + esc(s.slice(r, endTick)) + "</code>";
+          i = endTick + run.length;
           continue;
         }
+        out += esc(run);
+        i = r;
+        continue;
       }
       // image ![alt](url)
-      if (s.charAt(i) === "!" && s.charAt(i + 1) === "[") {
-        var im = rest().match(/^!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"([^"]*)")?\s*\)/);
+      if (c === "!" && s.charAt(i + 1) === "[") {
+        var im = bracketLink(s, i + 1, next, 0);
         if (im) {
-          var src = safeImg(im[2], opts && opts.assetBase);
-          if (src) {
-            out += '<img src="' + esc(src) + '" alt="' + esc(im[1]) + '"' +
-              (im[3] ? ' title="' + esc(im[3]) + '"' : "") +
-              ' loading="lazy" referrerpolicy="no-referrer">';
-          } else {
-            out += esc(im[1] || im[2]);
-          }
-          i += im[0].length;
+          out += imageHtml(im, opts);
+          i = im.end;
           continue;
         }
       }
       // link [text](url)
-      if (s.charAt(i) === "[") {
-        var lm = rest().match(/^\[([^\]]+)\]\(\s*<?([^)\s>]+)>?(?:\s+"([^"]*)")?\s*\)/);
+      if (c === "[") {
+        var lm = bracketLink(s, i, next, 1);
         if (lm) {
-          var href = safeHref(lm[2]);
-          var inner = inline(lm[1], opts);
+          var href = safeHref(lm.url);
+          var inner = inline(lm.text, opts, depth + 1);
           if (href) {
             var ext = href.charAt(0) !== "#";
             out += '<a href="' + esc(href) + '"' +
               (ext ? ' target="_blank" rel="noopener noreferrer"' : "") +
-              (lm[3] ? ' title="' + esc(lm[3]) + '"' : "") +
+              (lm.title ? ' title="' + esc(lm.title) + '"' : "") +
               ">" + inner + "</a>";
           } else {
             out += inner;
           }
-          i += lm[0].length;
+          i = lm.end;
           continue;
         }
       }
       // strong ** ** or __ __
-      if ((s.charAt(i) === "*" && s.charAt(i + 1) === "*") || (s.charAt(i) === "_" && s.charAt(i + 1) === "_")) {
-        var mark = s.slice(i, i + 2);
-        var close = s.indexOf(mark, i + 2);
+      if ((c === "*" || c === "_") && s.charAt(i + 1) === c) {
+        var mark = c + c;
+        var close = next(mark, i + 2);
         if (close !== -1) {
-          out += "<strong>" + inline(s.slice(i + 2, close), opts) + "</strong>";
+          out += "<strong>" + inline(s.slice(i + 2, close), opts, depth + 1) + "</strong>";
           i = close + 2;
           continue;
         }
       }
       // em * * or _ _ (not mid-word for _)
-      if (s.charAt(i) === "*" || (s.charAt(i) === "_" && (i === 0 || /\s/.test(s.charAt(i - 1))))) {
-        var ch = s.charAt(i);
-        var j = s.indexOf(ch, i + 1);
+      if (c === "*" || (c === "_" && (i === 0 || /\s/.test(s.charAt(i - 1))))) {
+        var j = next(c, i + 1);
         if (j !== -1 && j > i + 1) {
-          out += "<em>" + inline(s.slice(i + 1, j), opts) + "</em>";
+          out += "<em>" + inline(s.slice(i + 1, j), opts, depth + 1) + "</em>";
           i = j + 1;
           continue;
         }
       }
       // autolink <http://...>
-      if (s.charAt(i) === "<") {
-        var am = rest().match(/^<(https?:\/\/[^>\s]+)>/);
+      if (c === "<") {
+        AUTOLINK.lastIndex = i;
+        var am = AUTOLINK.exec(s);
         if (am && safeHref(am[1])) {
           out += '<a href="' + esc(am[1]) + '" target="_blank" rel="noopener noreferrer">' + esc(am[1]) + "</a>";
           i += am[0].length;
           continue;
         }
       }
-      out += esc(s.charAt(i));
+      out += esc(c);
       i += 1;
     }
     return out;
+  }
+
+  function imageHtml(im, opts) {
+    var src = safeImg(im.url, opts && opts.assetBase);
+    var alt = im.text;
+    if (!src) return esc(alt || im.url);
+    if (/^https?:\/\//i.test(src)) {
+      // Remote: a placeholder button. app.js swaps in the <img> only after a click.
+      if (!/^https:\/\//i.test(src)) return esc(alt || src);
+      var host = src.replace(/^https:\/\//i, "").split(/[\/?#]/)[0];
+      return '<button type="button" class="md-img-load" data-md-img="' + esc(src) + '" data-alt="' + esc(alt) + '"' +
+        (im.title ? ' data-title="' + esc(im.title) + '"' : "") +
+        ' title="Load image from ' + esc(host) + '">Load image' + (alt ? ": " + esc(alt) : "") +
+        " (" + esc(host) + ")</button>";
+    }
+    return '<img src="' + esc(src) + '" alt="' + esc(alt) + '"' +
+      (im.title ? ' title="' + esc(im.title) + '"' : "") +
+      ' loading="lazy" referrerpolicy="no-referrer">';
   }
 
   function isFence(line) {
@@ -144,11 +196,28 @@
     return i + 1 < lines.length && /\|/.test(lines[i]) && isSep(lines[i + 1]);
   }
 
-  function renderMarkdown(src, opts) {
+  var MAX_CHARS = 200 * 1024;   // rendered size cap; the rest is cut with a notice
+  var MAX_DEPTH = 8;            // nested blockquotes / lists beyond this render as plain text
+
+  function renderMarkdown(src, opts, depth) {
     opts = opts || {};
-    var lines = String(src == null ? "" : src).replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    depth = depth || 0;
+    var text = String(src == null ? "" : src);
+    var note = "";
+    var cap = opts.maxChars || MAX_CHARS;
+    if (depth === 0 && text.length > cap) {
+      var cut = text.lastIndexOf("\n", cap);
+      text = text.slice(0, cut > cap / 2 ? cut : cap);
+      note = '<p class="md-note">README truncated at ' + Math.round(cap / 1024) +
+        ' KB. Use \u201cView raw\u201d or open the file to read the rest.</p>';
+    }
+    var lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
     var i = 0;
     var html = [];
+    function nestedOrPlain(md) {
+      if (depth + 1 >= MAX_DEPTH) return "<p>" + esc(md).replace(/\n/g, "<br>") + "</p>";
+      return renderMarkdown(md, opts, depth + 1);
+    }
 
     function takeFence(open) {
       i += 1;
@@ -169,7 +238,7 @@
         buf.push(lines[i].replace(/^\s{0,3}>\s?/, ""));
         i += 1;
       }
-      html.push("<blockquote>" + renderMarkdown(buf.join("\n"), opts) + "</blockquote>");
+      html.push("<blockquote>" + nestedOrPlain(buf.join("\n")) + "</blockquote>");
     }
 
     function takeList() {
@@ -184,7 +253,7 @@
           i += 1;
         }
         var body = inline(text, opts);
-        if (nested.length) body += renderMarkdown(nested.join("\n"), opts);
+        if (nested.length) body += nestedOrPlain(nested.join("\n"));
         items.push("<li>" + body + "</li>");
       }
       html.push((ordered ? "<ol>" : "<ul>") + items.join("") + (ordered ? "</ol>" : "</ul>"));
@@ -205,7 +274,7 @@
         i += 1;
       }
       function cell(tag, val, idx) {
-        var a = align[idx] ? ' style="text-align:' + align[idx] + '"' : "";
+        var a = align[idx] ? ' class="ta-' + align[idx] + '"' : "";
         return "<" + tag + a + ">" + inline(val, opts) + "</" + tag + ">";
       }
       var thead = "<thead><tr>" + heads.map(function (h, n) { return cell("th", h, n); }).join("") + "</tr></thead>";
@@ -241,11 +310,11 @@
       if (looksTable(lines, i)) { takeTable(); continue; }
       takePara();
     }
-    return html.join("");
+    return html.join("") + note;
   }
 
   var api = { renderMarkdown: renderMarkdown, safeHref: safeHref, safeImg: safeImg, esc: esc };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.renderMarkdown = renderMarkdown;
-  root.LauncherMarkdown = api;
+  root.SlothmoreMarkdown = api;
 })(typeof window !== "undefined" ? window : typeof globalThis !== "undefined" ? globalThis : this);
