@@ -4,6 +4,8 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const NATIVE = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.slothmore) || null;
+// In the menu bar panel the window itself is transparent; the page draws the rounded dark card and its border (compact.css).
+if (NATIVE) document.documentElement.classList.add("in-panel");
 const Q = { items: [], ports: [], ai: { servers: [], agents: [] }, q: "", rows: [], sel: 0, open: {}, confirm: null, busy: false, timer: null, statusTimer: null };
 
 // Messages to the menu bar helper (WKScriptMessageHandler "slothmore"). In a browser tab we fall back to plain web behaviour.

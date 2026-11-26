@@ -9,6 +9,9 @@ html{color-scheme:dark}
 html,body{margin:0;background:var(--bg);color:var(--ink)}
 body{font:12.5px/1.4 var(--font);font-weight:500;font-feature-settings:"calt" 0,"liga" 0;letter-spacing:-.01em;-webkit-font-smoothing:antialiased;overflow:hidden}
 button,input{font:inherit;color:inherit}
+/* Menu bar quick panel: the native window is transparent, so the rounded card and its hairline border are drawn here. */
+html.in-panel,html.in-panel body{background:transparent}
+html.in-panel .qp{max-width:none;border-radius:14px;border:1px solid rgba(179,219,224,.22);overflow:hidden}
 .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .qp{width:100%;max-width:440px;display:flex;flex-direction:column;max-height:600px;background:var(--bg);
   background-image:radial-gradient(ellipse 380px 160px at 0% 0%,rgba(62,224,212,.10),transparent 70%)}
