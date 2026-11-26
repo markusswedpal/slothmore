@@ -89,9 +89,13 @@ main{flex:999 1 560px;min-width:0;display:flex;flex-direction:column;gap:24px}
 .brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:800;letter-spacing:-.04em;font-family:var(--font);font-style:normal;font-feature-settings:var(--ui-feat)}
 .mark{
   width:32px;height:32px;border-radius:8px;
-  background:linear-gradient(145deg,var(--accent),#149E96);
+  background:#070B10;
   box-shadow:0 0 18px rgba(62,224,212,.35);
-  display:flex;align-items:center;justify-content:center;
+  display:block;flex:0 0 auto;object-fit:cover;
+}
+.login-mark{
+  display:block;width:72px;height:72px;border-radius:16px;margin:0 auto 16px;
+  background:#070B10;box-shadow:0 0 18px rgba(62,224,212,.25);
 }
 .eyebrow{font-family:var(--font);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:500;font-style:normal;font-feature-settings:var(--ui-feat)}
 .btn{
@@ -571,8 +575,8 @@ dialog .line input{
 /* sign-in page (served with 401 when the access cookie is missing) */
 .login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
 .login-card{max-width:460px;width:100%;padding:28px;border:1px solid var(--border);border-radius:14px;background:var(--surface-solid)}
-.login-card h1{margin:0 0 12px;font-size:24px;font-weight:800;letter-spacing:-.04em}
-.login-card p{color:var(--muted);font-size:13px;line-height:1.55}
+.login-card h1{margin:0 0 12px;font-size:24px;font-weight:800;letter-spacing:-.04em;text-align:center}
+.login-card p{color:var(--muted);font-size:13px;line-height:1.55;text-align:center}
 .login-card pre{padding:10px 12px;border-radius:8px;background:var(--term);color:var(--accent);font-family:var(--mono)}
 .login-card label{display:block;margin:14px 0 6px;font-size:12px;color:var(--muted)}
 .login-card code{font-family:var(--mono)}

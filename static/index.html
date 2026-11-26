@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Slothmore</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
 <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <meta name="theme-color" content="#070B10">
 <link rel="stylesheet" href="/app.css">
@@ -13,7 +15,7 @@
 <body>
 <div class="shell">
   <aside>
-    <div class="brand"><span class="mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#042321" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l6 6-6 6M12 19h8"/></svg></span>Slothmore</div>
+    <div class="brand"><img class="mark" src="/icons/mark-64.png" srcset="/icons/mark-64.png 1x, /icons/mark-128.png 2x" width="32" height="32" alt="">Slothmore</div>
     <nav aria-label="Sources" style="display:flex;flex-direction:column;gap:8px">
       <h2 class="eyebrow">Sources</h2>
       <ul class="nav" id="nav"></ul>
@@ -35,6 +37,7 @@
       </ul>
     </nav>
     <button type="button" class="btn dashed" id="notifBtn" style="justify-content:flex-start">Notifications: off</button>
+    <button type="button" class="btn dashed" id="menubarBtn" style="justify-content:flex-start" hidden title="Show Slothmore in the macOS menu bar, started at every login">Menu bar icon: off</button>
     <div class="server">
       <div style="display:flex;align-items:center;gap:8px;font-weight:600"><span class="dot"></span>Slothmore server running</div>
       <div class="mono" id="serverInfo">127.0.0.1 · local only</div>

@@ -1765,6 +1765,28 @@ $("#aiSave").onclick = async () => {
 };
 pollAI(true);
 
+// ---------------------------------------------------------------- menu bar login item (macOS)
+const MB = { data: null };
+function renderMenubarBtn() {
+  const b = $("#menubarBtn");
+  if (!b) return;
+  const d = MB.data;
+  b.hidden = !(d && d.supported);
+  if (d) b.textContent = "Menu bar icon: " + (d.installed ? "on" : "off");
+}
+async function loadMenubar() {
+  const r = await api("/api/menubar");
+  if (r.ok) { MB.data = r.data; renderMenubarBtn(); }
+}
+$("#menubarBtn").onclick = async () => {
+  const want = !(MB.data && MB.data.installed);
+  const r = await api("/api/menubar", "POST", { enabled: want });
+  if (!r.ok) { notify((r.data && r.data.error) || "Could not change the menu bar setting."); return; }
+  MB.data = r.data; renderMenubarBtn();
+  notify(want ? "Menu bar icon turned on. It starts at every login." : "Menu bar icon turned off.");
+};
+loadMenubar();
+
 // ---------------------------------------------------------------- ports
 const Ports = { open: false, data: null, timer: null, q: "" };
 
