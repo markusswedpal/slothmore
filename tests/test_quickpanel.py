@@ -77,12 +77,34 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(qp.parse_message({"action": "close"}), ("close", None))
         self.assertEqual(qp.parse_message({"action": "quit"}), ("quit", None))
         self.assertEqual(qp.parse_message({"action": "openFull"}), ("openFull", None))
+        self.assertEqual(qp.parse_message({"action": "openFull", "add": "watch"}), ("openFull", "watch"))
+        self.assertEqual(qp.parse_message({"action": "openFull", "add": "pin"}), ("openFull", "pin"))
+        self.assertIsNone(qp.parse_message({"action": "openFull", "add": "evil"}))
+        self.assertEqual(qp.parse_message({"action": "pickFolder", "mode": "watch"}), ("pickFolder", "watch"))
+        self.assertEqual(qp.parse_message({"action": "pickFolder", "mode": "pin"}), ("pickFolder", "pin"))
+        self.assertIsNone(qp.parse_message({"action": "pickFolder", "mode": "other"}))
+        self.assertIsNone(qp.parse_message({"action": "pickFolder"}))
         self.assertEqual(qp.parse_message({"action": "height", "value": 9999}), ("height", qp.PANEL_MAX_HEIGHT))
         self.assertEqual(qp.parse_message({"action": "openURL", "url": "http://localhost:8001"}), ("openURL", "http://localhost:8001"))
         self.assertIsNone(qp.parse_message({"action": "openURL", "url": "file:///Applications/Calculator.app"}))
         self.assertIsNone(qp.parse_message({"action": "rm -rf"}))
         self.assertIsNone(qp.parse_message("close"))
         self.assertIsNone(qp.parse_message(None))
+
+    def test_picked_js_and_prompts(self):
+        js = qp.picked_js("watch", "/Users/me/Projects")
+        self.assertIn("slothmorePicked", js)
+        self.assertIn("'watch'", js)
+        self.assertIn("'/Users/me/Projects'", js)
+        sneaky = qp.picked_js("pin", "/tmp/it's\\a/path")
+        self.assertIn("\\'", sneaky)  # escaped quote
+        self.assertIsNone(qp.picked_js("watch", ""))
+        self.assertIsNone(qp.picked_js("other", "/tmp/x"))
+        title, msg = qp.pick_folder_prompt("watch")
+        self.assertEqual(title, "Add folder to watch")
+        self.assertIn("subfolders", msg)
+        title, msg = qp.pick_folder_prompt("pin")
+        self.assertEqual(title, "Add single project")
 
     def test_hotkey(self):
         self.assertIsNone(qp.parse_hotkey(None))
@@ -646,6 +668,48 @@ class CocoaPanelTests(unittest.TestCase):
         qp2 = load("quickpanel_cocoa_again", "quickpanel.py")
         C = qp2._classes()
         self.assertIs(C["panel"], self.fx.objc.registry["SlothmoreQuickPanel"])
+
+    def test_pick_folder_evaluates_js_without_hiding(self):
+        p = self.make()
+        p.panel.ret["isVisible"] = True
+        with mock.patch.object(self.qp, "run_native_open_panel", return_value="/Users/me/Projects"):
+            p.on_message({"action": "pickFolder", "mode": "watch"})
+        self.assertEqual(p.panel.called("orderOut_"), [])
+        self.assertFalse(p.picking)
+        calls = p.web.called("evaluateJavaScript_completionHandler_")
+        self.assertTrue(calls)
+        script, handler = calls[-1]
+        self.assertIsNone(handler)
+        self.assertIn("slothmorePicked", script)
+        self.assertIn("/Users/me/Projects", script)
+        self.assertIn("'watch'", script)
+
+    def test_cancelled_pick_does_not_eval(self):
+        p = self.make()
+        before = len(p.web.called("evaluateJavaScript_completionHandler_"))
+        with mock.patch.object(self.qp, "run_native_open_panel", return_value=None):
+            p.on_message({"action": "pickFolder", "mode": "pin"})
+        self.assertEqual(len(p.web.called("evaluateJavaScript_completionHandler_")), before)
+        self.assertFalse(p.picking)
+
+    def test_hide_is_ignored_while_picking(self):
+        p = self.make()
+        p.panel.ret["isVisible"] = True
+        p.picking = True
+        p.hide()
+        self.assertEqual(p.panel.called("orderOut_"), [])
+        p.picking = False
+        p.hide()
+        self.assertEqual(len(p.panel.called("orderOut_")), 1)
+
+    def test_open_full_passes_add_mode(self):
+        p = self.make()
+        p.panel.ret["isVisible"] = True
+        p.on_message({"action": "openFull", "add": "watch"})
+        self.hooks["open_full"].assert_called_once_with("watch")
+        self.assertEqual(len(p.panel.called("orderOut_")), 1)
+        p.on_message({"action": "openFull"})
+        self.hooks["open_full"].assert_called_with(None)
 
 
 if __name__ == "__main__":

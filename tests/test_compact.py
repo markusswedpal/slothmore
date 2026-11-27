@@ -82,15 +82,35 @@ class CompactPageTests(unittest.TestCase):
         self.assertIn("messageHandlers", js)
         self.assertIn("install_run", js)
         self.assertIn("function startAction", js)
+        self.assertIn("No folders yet", js)
+        self.assertIn("Add folder to watch", js)
+        self.assertIn("Add single project", js)
+        self.assertIn("Open full window", js)
+        self.assertIn("function emptySetupHtml", js)
+        self.assertIn("function addFolder", js)
+        self.assertIn("function isFreshSetup", js)
+        self.assertIn("slothmorePicked", js)
+        self.assertIn('pickFolder', js)
+        self.assertIn("?add=", js)
+        self.assertIn('"/api/watch"', js)
+        self.assertIn('"/api/pin"', js)
         # Every dynamic value that reaches innerHTML goes through esc(); the name fields must.
         for field in ("esc(i.name)", "esc(name)", "esc(s.name)", "esc(r.name)"):
             self.assertIn(field, js)
+
+    def test_html_has_open_full_window(self):
+        html = (server.STATIC / "compact.html").read_text()
+        self.assertIn("Open full window", html)
+        self.assertIn('id="fullBtn"', html)
+        self.assertNotIn("Full view", html)
 
     def test_css_style(self):
         css = (server.STATIC / "compact.css").read_text()
         self.assertIn("JetBrains Mono", css)
         self.assertIn("#0B1016", css)
         self.assertIn("max-height:600px", css)
+        self.assertIn(".qp-empty", css)
+        self.assertIn(".qb.full", css)
 
 
 class StopAllMineTests(unittest.TestCase):
