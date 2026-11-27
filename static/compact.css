@@ -66,3 +66,11 @@ html.in-panel .qp{max-width:none;border-radius:14px;border:1px solid rgba(179,21
 .qp-ai .aichip .m{color:var(--muted)}
 .qp-foot{display:flex;align-items:center;gap:2px;padding:8px 8px;border-top:1px solid var(--border);background:rgba(0,0,0,.18)}
 .qp-spacer{flex:1}
+.qb.full{color:var(--ink);border-color:rgba(62,224,212,.45);background:rgba(62,224,212,.10)}
+.qb.full:hover{border-color:var(--accent);background:rgba(62,224,212,.18)}
+.qp-empty{display:flex;flex-direction:column;align-items:center;text-align:center;padding:18px 16px 22px;gap:8px}
+.qp-empty-mark{width:40px;height:40px;border-radius:10px;box-shadow:0 0 16px rgba(62,224,212,.28)}
+.qp-empty-title{margin:4px 0 0;font-size:14px;font-weight:600}
+.qp-empty-sub{margin:0;color:var(--muted);font-size:11.5px;max-width:300px;line-height:1.45}
+.qp-empty-acts{display:flex;flex-direction:column;align-items:stretch;gap:6px;width:100%;max-width:260px;margin-top:8px}
+.qp-empty-acts .qb{height:32px;justify-content:center;padding:0 12px}

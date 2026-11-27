@@ -6,7 +6,7 @@ const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 const NATIVE = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.slothmore) || null;
 // In the menu bar panel the window itself is transparent; the page draws the rounded dark card and its border (compact.css).
 if (NATIVE) document.documentElement.classList.add("in-panel");
-const Q = { items: [], ports: [], ai: { servers: [], agents: [] }, q: "", rows: [], sel: 0, open: {}, confirm: null, busy: false, timer: null, statusTimer: null };
+const Q = { items: [], watch: [], pinned: 0, ports: [], ai: { servers: [], agents: [] }, q: "", rows: [], sel: 0, open: {}, confirm: null, busy: false, timer: null, statusTimer: null };
 
 // Messages to the menu bar helper (WKScriptMessageHandler "slothmore"). In a browser tab we fall back to plain web behaviour.
 function native(action, extra) {
@@ -15,7 +15,35 @@ function native(action, extra) {
   return false;
 }
 function openUrl(url) { if (!url) return; if (!native("openURL", { url })) window.open(url, "_blank", "noopener"); }
-function openFull() { if (!native("openFull")) window.open("/", "_blank", "noopener"); }
+function openFull(add) {
+  const extra = (add === "watch" || add === "pin") ? { add } : undefined;
+  if (!native("openFull", extra)) {
+    const q = extra ? ("?add=" + encodeURIComponent(add)) : "";
+    window.open("/" + q, "_blank", "noopener");
+  }
+}
+function hasFolders() { return (Q.watch && Q.watch.length) || Q.pinned > 0 || Q.items.length > 0; }
+function isFreshSetup() { return !Q.q.trim() && !hasFolders(); }
+function addFolder(mode) {
+  if (mode !== "watch" && mode !== "pin") return;
+  if (native("pickFolder", { mode })) { status("Choose a folder…"); return; }
+  // In a browser tab there is no native picker; open the full dashboard on its add-folder flow.
+  openFull(mode);
+}
+window.slothmorePicked = async function (mode, path) {
+  if (mode !== "watch" && mode !== "pin") return;
+  if (!path) { status(""); return; }
+  const url = mode === "watch" ? "/api/watch" : "/api/pin";
+  status("Adding folder…");
+  const r = await api(url, "POST", { path });
+  if (!r.ok) { status(r.data.detail || r.data.error || "Could not add that folder.", "err"); return; }
+  Q.items = r.data.items || [];
+  Q.watch = r.data.watch || [];
+  Q.pinned = r.data.pinned || 0;
+  const name = path.replace(/\/+$/, "").split("/").pop() || path;
+  status((mode === "watch" ? "Watching " : "Added ") + name + ".", "ok");
+  render();
+};
 function closePanel() { native("close"); }
 function quitHelper() { if (!native("quit")) status("Quit closes the menu bar helper; this is a browser tab.", "info"); }
 
@@ -45,6 +73,8 @@ async function refresh() {
   if (it.status === 401) { status("Signed out. Run `slothmore open` in Terminal, then reopen the panel.", "err"); return; }
   if (!it.ok) { status(it.data.error || "Can't load projects.", "err"); return; }
   Q.items = it.data.items || [];
+  Q.watch = it.data.watch || [];
+  Q.pinned = it.data.pinned || 0;
   Q.ports = po.ok ? (po.data.ports || []) : [];
   Q.ai = ai.ok ? { servers: ai.data.servers || [], agents: ai.data.agents || [] } : { servers: [], agents: [] };
   render();
@@ -173,19 +203,41 @@ function renderAi() {
   el.hidden = false;
 }
 
+function emptySetupHtml() {
+  return '<div class="qp-empty" id="emptySetup">' +
+    '<img class="qp-empty-mark" src="/icons/mark-64.png" srcset="/icons/mark-64.png 1x, /icons/mark-128.png 2x" width="40" height="40" alt="">' +
+    '<p class="qp-empty-title">No folders yet</p>' +
+    '<p class="qp-empty-sub">Add a folder and Slothmore will find projects to start. Or open the full window for the same thing with more room.</p>' +
+    '<div class="qp-empty-acts">' +
+      '<button type="button" class="qb primary" data-add="watch" title="A folder whose subfolders are projects">Add folder to watch</button>' +
+      '<button type="button" class="qb" data-add="pin" title="One folder = one project">Add single project</button>' +
+      '<button type="button" class="qb full" data-open-full title="Open the full dashboard (⌘O)">Open full window</button>' +
+    "</div></div>";
+}
+
 function render() {
   renderAi();
   const sections = buildRows();
   Q.rows = [];
   let h = "";
-  for (const sec of sections) {
-    if (!sec.rows.length && !sec.empty) continue;
-    h += '<div class="qp-sec">' + esc(sec.title) + (sec.rows.length ? ' <span class="n">' + sec.rows.length + (sec.more ? "+" : "") + "</span>" : "") + "</div>";
-    if (!sec.rows.length) { h += '<div class="empty">' + esc(sec.empty) + "</div>"; continue; }
-    for (const r of sec.rows) { h += rowHtml(r, Q.rows.length); Q.rows.push(r); }
-    if (sec.more) h += '<div class="empty">+' + sec.more + " more · type to search</div>";
+  if (isFreshSetup()) {
+    h = emptySetupHtml();
+    const ports = sections.find((s) => s.title === "Ports");
+    if (ports && ports.rows.length) {
+      h += '<div class="qp-sec">' + esc(ports.title) + ' <span class="n">' + ports.rows.length + (ports.more ? "+" : "") + "</span></div>";
+      for (const r of ports.rows) { h += rowHtml(r, Q.rows.length); Q.rows.push(r); }
+      if (ports.more) h += '<div class="empty">+' + ports.more + " more · type to search</div>";
+    }
+  } else {
+    for (const sec of sections) {
+      if (!sec.rows.length && !sec.empty) continue;
+      h += '<div class="qp-sec">' + esc(sec.title) + (sec.rows.length ? ' <span class="n">' + sec.rows.length + (sec.more ? "+" : "") + "</span>" : "") + "</div>";
+      if (!sec.rows.length) { h += '<div class="empty">' + esc(sec.empty) + "</div>"; continue; }
+      for (const r of sec.rows) { h += rowHtml(r, Q.rows.length); Q.rows.push(r); }
+      if (sec.more) h += '<div class="empty">+' + sec.more + " more · type to search</div>";
+    }
+    if (!Q.rows.length && Q.q) h = '<div class="empty">No match for “' + esc(Q.q) + '”.</div>';
   }
-  if (!Q.rows.length && Q.q) h = '<div class="empty">No match for “' + esc(Q.q) + '”.</div>';
   if (Q.sel >= Q.rows.length) Q.sel = Math.max(0, Q.rows.length - 1);
   $("#list").innerHTML = h;
   // Re-apply selection (rowHtml used Q.sel before clamping).
@@ -289,6 +341,10 @@ function killAll() {
 // ------------------------------------------------------------------ events
 $("#q").addEventListener("input", (e) => { Q.q = e.target.value; Q.sel = 0; render(); });
 $("#list").addEventListener("click", (e) => {
+  const add = e.target.closest("[data-add]");
+  if (add) { e.stopPropagation(); return addFolder(add.dataset.add); }
+  const full = e.target.closest("[data-open-full]");
+  if (full) { e.stopPropagation(); return openFull(); }
   const b = e.target.closest("[data-act]");
   if (b) { e.stopPropagation(); return act(b.dataset.act, Number(b.dataset.i), b); }
   const row = e.target.closest(".row");

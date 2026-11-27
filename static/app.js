@@ -1912,9 +1912,22 @@ document.addEventListener("click", (e) => {
   if (st) { stopPort(st.dataset.portStop, st.dataset.pid, st.dataset.cmd); }
 });
 
+function openAddFromUrl() {
+  try {
+    const add = new URLSearchParams(location.search).get("add");
+    if (add === "watch" || add === "pin") {
+      openDialog();
+      const el = add === "watch" ? $("#watchPath") : $("#pinPath");
+      if (el) el.focus();
+      history.replaceState({}, "", location.pathname + (location.hash || ""));
+    }
+  } catch (e) {}
+}
+
 // ---------------------------------------------------------------- boot
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 loadSettings();
+openAddFromUrl();
 refresh();
 setInterval(refresh, 1500);
 if (localStorage.getItem("launcher.portsOpen") === "1") { Ports.open = true; }
