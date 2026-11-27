@@ -80,6 +80,8 @@ class CompactPageTests(unittest.TestCase):
         self.assertIn("confirm: true", js)
         self.assertIn('"/api/runs/stop-all"', js)
         self.assertIn("messageHandlers", js)
+        self.assertIn("install_run", js)
+        self.assertIn("function startAction", js)
         # Every dynamic value that reaches innerHTML goes through esc(); the name fields must.
         for field in ("esc(i.name)", "esc(name)", "esc(s.name)", "esc(r.name)"):
             self.assertIn(field, js)
