@@ -21,7 +21,7 @@ PANEL_GAP = 6          # points between the menu bar and the panel
 SCREEN_MARGIN = 8      # keep the panel this far from the screen edges
 CORNER_RADIUS = 14
 REOPEN_GUARD = 0.3     # a click on the icon right after the panel closed itself should not reopen it
-ACTIONS = ("close", "quit", "openFull", "openURL", "height", "startServer", "retry")
+ACTIONS = ("close", "quit", "openFull", "openURL", "height", "startServer", "retry", "pickFolder")
 
 # --------------------------------------------------------------------------- pure helpers
 
@@ -120,7 +120,35 @@ def parse_message(body):
         return ("openURL", url)
     if action == "height":
         return ("height", clamp_height(body.get("value")))
+    if action == "pickFolder":
+        mode = str(body.get("mode") or "")
+        if mode not in ("watch", "pin"):
+            return None
+        return ("pickFolder", mode)
+    if action == "openFull":
+        add = str(body.get("add") or "") or None
+        if add not in (None, "watch", "pin"):
+            return None
+        return ("openFull", add)
     return (action, None)
+
+
+def js_string(s):
+    """A single-quoted JavaScript string literal (no raw newlines)."""
+    return "'" + str(s).replace("\\", "\\\\").replace("'", "\\'").replace("\r", "\\r").replace("\n", "\\n") + "'"
+
+
+def picked_js(mode, path):
+    """JS the panel evaluates after a native folder pick. mode is 'watch' or 'pin'."""
+    if mode not in ("watch", "pin") or not path:
+        return None
+    return "window.slothmorePicked && window.slothmorePicked(%s, %s)" % (js_string(mode), js_string(path))
+
+
+def pick_folder_prompt(mode):
+    if mode == "watch":
+        return ("Add folder to watch", "Projects in this folder and its subfolders will show up in Slothmore.")
+    return ("Add single project", "This folder will appear as one project.")
 
 
 MODIFIERS = {"cmd": 1 << 20, "command": 1 << 20, "alt": 1 << 19, "option": 1 << 19, "opt": 1 << 19,
@@ -240,6 +268,34 @@ def _responds(obj, name):
         return False
 
 
+def run_native_open_panel(mode):
+    """Modal macOS folder picker. Returns a POSIX path, or None if the user cancelled.
+
+    Uses NSOpenPanel.runModal (no completion-handler block) so PyObjC never has to call a block.
+    """
+    from AppKit import NSModalResponseOK, NSOpenPanel
+
+    title, message = pick_folder_prompt(mode)
+    panel = NSOpenPanel.openPanel()
+    panel.setCanChooseFiles_(False)
+    panel.setCanChooseDirectories_(True)
+    panel.setAllowsMultipleSelection_(False)
+    panel.setCanCreateDirectories_(False)
+    if _responds(panel, "setTitle:"):
+        panel.setTitle_(title)
+    if _responds(panel, "setMessage:"):
+        panel.setMessage_(message)
+    if _responds(panel, "setPrompt:"):
+        panel.setPrompt_("Add")
+    if panel.runModal() != NSModalResponseOK:
+        return None
+    url = panel.URL()
+    path = url.path() if url is not None else None
+    if not path:
+        return None
+    return str(path).rstrip("/")
+
+
 def _classes():
     """Define the Objective-C subclasses once per process (the class names are global to the runtime)."""
     if _CLASSES:
@@ -351,6 +407,7 @@ class QuickPanel:
         self.status_item, self.base_fn, self.token_fn, self.hooks = status_item, base_fn, token_fn, hooks
         self.last_hidden_at, self.loaded_base, self.monitor, self.hotkey_monitors = None, None, None, []
         self.failed, self.first_show_pending, self.classic_menu, self.wired = False, True, None, False
+        self.picking = False  # True while NSOpenPanel is up, so losing key focus does not close us
         self.app = _shared_app()
         self.bridge = C["bridge"].alloc().init()
         self.frame = (0, 0, PANEL_WIDTH, PANEL_START_HEIGHT)
@@ -520,6 +577,8 @@ class QuickPanel:
                 self.monitor = None
 
     def hide(self):
+        if self.picking:
+            return
         if self.monitor is not None:
             m, self.monitor = self.monitor, None
             try:
@@ -604,7 +663,9 @@ class QuickPanel:
             self.hooks["open_url"](value)
         elif action == "openFull":
             self.hide()
-            self.hooks["open_full"]()
+            self.hooks["open_full"](value)
+        elif action == "pickFolder":
+            self.pick_folder(value)
         elif action == "quit":
             self.hide()
             self.hooks["quit"]()
@@ -613,6 +674,28 @@ class QuickPanel:
             self._retry_later(2.5)
         elif action == "retry":
             self.retry()
+
+    def _eval_js(self, script):
+        # completionHandler is nil, so Python never calls an Objective-C block.
+        if script:
+            self.web.evaluateJavaScript_completionHandler_(script, None)
+
+    def pick_folder(self, mode):
+        """Show a native folder picker (NSOpenPanel.runModal, no completion-handler block)."""
+        if mode not in ("watch", "pin"):
+            return
+        self.picking = True
+        try:
+            path = run_native_open_panel(mode)
+            js = picked_js(mode, path)
+            if js:
+                self._eval_js(js)
+        finally:
+            self.picking = False
+            try:
+                self.panel.makeKeyAndOrderFront_(None)
+            except Exception:
+                pass
 
     def _retry_later(self, seconds):
         # performSelector:afterDelay: runs on the main run loop and needs no block.

@@ -23,7 +23,7 @@ import time
 import traceback
 import urllib.request
 
-VERSION = "0.2.3"  # keep in sync with server.__version__ (a test checks it)
+VERSION = "0.2.4"  # keep in sync with server.__version__ (a test checks it)
 
 DEFAULT_URL = os.environ.get("SLOTHMORE_URL") or os.environ.get("LAUNCHER_URL") or "http://127.0.0.1:7777"
 MAX_STOPPED = 20  # stopped items listed under "Start"
@@ -148,14 +148,32 @@ def build_model(listing):
             "stopped": stopped[:MAX_STOPPED], "more": max(0, len(stopped) - MAX_STOPPED), "groups": groups}
 
 
-def open_dashboard(base):
+def dashboard_url(base, token=None, add=None):
+    """Signed-in dashboard URL, optionally opening the add-folder dialog (?add=watch or ?add=pin)."""
+    q = []
+    if token:
+        q.append("token=" + token)
+    if add in ("watch", "pin"):
+        q.append("add=" + add)
+    return base.rstrip("/") + "/" + (("?" + "&".join(q)) if q else "")
+
+
+def open_dashboard(base, add=None):
     # Prefer the installed web app (Dock app named "Slothmore", then a leftover "Launcher"); fall back to the default browser.
     # The installed web app keeps its sign-in cookie; the browser gets the token once in the URL.
+    # When opening the add-folder flow we pass the URL so the dialog can open.
+    tok = read_token()
+    url = dashboard_url(base, token=tok, add=add)
+    if add in ("watch", "pin"):
+        for app in ("Slothmore", "Launcher"):
+            if subprocess.call(["open", "-a", app, url], stderr=subprocess.DEVNULL) == 0:
+                return
+        subprocess.call(["open", url])
+        return
     for app in ("Slothmore", "Launcher"):
         if subprocess.call(["open", "-a", app], stderr=subprocess.DEVNULL) == 0:
             return
-    tok = read_token()
-    subprocess.call(["open", base.rstrip("/") + "/" + ("?token=" + tok if tok else "")])
+    subprocess.call(["open", url])
 
 
 def load_quickpanel():
@@ -307,7 +325,7 @@ def make_app(rumps, client, panel=True, hotkey=None):
                 except Exception:
                     pass
 
-            return {"quit": quit_helper, "open_full": lambda: open_dashboard(client.base),
+            return {"quit": quit_helper, "open_full": lambda add=None: open_dashboard(client.base, add=add),
                     "open_url": open_url, "start_server": start_server,
                     "panel_starting": lambda: write_panel_state(STARTING),
                     "panel_ok": clear_panel_state, "panel_failed": failed}
