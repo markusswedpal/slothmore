@@ -436,6 +436,7 @@ dialog .line input{
 .card-err{font-family:var(--info);font-size:12.5px;color:var(--danger);background:rgba(255,155,122,.06);border:1px solid rgba(255,155,122,.25);border-radius:8px;padding:7px 10px;overflow-wrap:anywhere}
 .deps{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-family:var(--info);font-size:12.5px;color:var(--amber);background:rgba(245,196,81,.06);border:1px solid rgba(245,196,81,.25);border-radius:8px;padding:6px 8px 6px 10px}
 .deps code{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.deps-acts{display:flex;gap:6px;flex-shrink:0;align-items:center}
 .subgroup{display:flex;flex-direction:column;gap:10px;margin-top:6px}
 .subgroup-head{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--muted)}
 .subgroup-head b{color:var(--ink);font-weight:500}

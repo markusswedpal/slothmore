@@ -282,9 +282,13 @@ function cardHtml(it, draggable) {
   }
   if (it.deps_missing && it.install_cmd) {
     const blocked = it.install_missing_tool;
+    const busy = blocked || it.running || it.install_run_pending;
     extra += '<div class="deps" data-deps-for="' + esc(it.id) + '"><span>Dependencies not installed · <code>' + esc(it.install_cmd) + "</code></span>" +
-      '<button type="button" class="btn xs" data-install="' + esc(it.id) + '"' + (blocked || it.running ? " disabled" : "") +
-      ' title="' + esc(blocked ? blocked + " isn't installed" : "Runs " + it.install_cmd + " here; output shows below") + '">Install</button></div>';
+      '<span class="deps-acts">' +
+      '<button type="button" class="btn xs" data-install="' + esc(it.id) + '"' + (busy ? " disabled" : "") +
+      ' title="' + esc(blocked ? blocked + " isn't installed" : "Runs " + it.install_cmd + " here; output shows below") + '">Install</button>' +
+      '<button type="button" class="btn xs primary" data-install-run="' + esc(it.id) + '"' + (busy ? " disabled" : "") +
+      ' title="' + esc(blocked ? blocked + " isn't installed" : "Runs " + it.install_cmd + ", then starts the project") + '">Install and run</button></span></div>';
   }
   if (it.static && it.html_files && it.html_files.length > 1) {
     const opts = it.html_files.map((f) =>
@@ -761,6 +765,7 @@ document.addEventListener("click", async (e) => {
   if (t.dataset.history) { openHistory(t.dataset.history); return; }
   if (t.dataset.renameBtn) { startRename(t.dataset.renameBtn); return; }
   if (t.dataset.install) { installItem(t.dataset.install); return; }
+  if (t.dataset.installRun) { installAndRunItem(t.dataset.installRun); return; }
   if (t.dataset.watchLoose) {
     const w = S.watch.find((x) => x.raw === t.dataset.watchLoose);
     const r = await api("/api/watch-opts", "POST", { path: t.dataset.watchLoose, loose: !(w && w.loose) });
@@ -1244,6 +1249,15 @@ async function installItem(id) {
   if (!r.ok) notify((r.data && r.data.error) || "Could not start the install.");
   S.last = "";
   await refresh();
+}
+async function installAndRunItem(id) {
+  select(id);
+  const r = await itemAction(id, "install_run", buildStartBody(id));
+  if (!r.ok) notify((r.data && r.data.error) || "Could not start the install.");
+  S.last = "";
+  S.pendingRender = false;
+  await refresh();
+  S.sel = id; openStream(id); render(); renderTermHeader();
 }
 
 $("#yes").onclick = () => send("y\n");

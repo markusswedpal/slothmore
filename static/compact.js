@@ -132,7 +132,8 @@ function rowHtml(r, idx) {
   }
   if (r.kind === "proj") {
     const i = r.it, sub = [i.source === "pinned" ? "pinned" : "", i.last_run ? "ran " + ago(i.last_run.started) : "", i.run_cmd || i.cmd || ""].filter(Boolean).join(" · ");
-    return '<div class="row' + sel + '" role="option" data-i="' + idx + '"><span class="dot"></span><span class="r-main"><span class="r-name">' + esc(i.name) + '</span><span class="r-sub">' + esc(sub) + '</span></span><span class="r-acts">' + a("start", "Start", "primary") + "</span></div>";
+    const startLbl = (i.deps_missing && i.install_cmd && !i.install_missing_tool) ? "Install and run" : "Start";
+    return '<div class="row' + sel + '" role="option" data-i="' + idx + '"><span class="dot"></span><span class="r-main"><span class="r-name">' + esc(i.name) + '</span><span class="r-sub">' + esc(sub) + '</span></span><span class="r-acts">' + a("start", startLbl, "primary") + "</span></div>";
   }
   if (r.kind === "port") {
     const g = r.g, n = g.ports.length, open = !!Q.open[g.key];
@@ -220,11 +221,17 @@ function ask(text, yesLabel, fn) {
 }
 function closeAsk() { Q.confirm = null; $("#confirm").hidden = true; $("#q").focus(); fit(); }
 
+function startAction(it) {
+  return (it.deps_missing && it.install_cmd && !it.install_missing_tool) ? "install_run" : "start";
+}
+
 async function itemAction(it, action) {
-  status((action === "start" ? "Starting " : action === "stop" ? "Stopping " : "Restarting ") + it.name + "…");
+  const starting = { start: "Starting ", stop: "Stopping ", restart: "Restarting ", install_run: "Installing and starting " };
+  const done = { start: "started", stop: "stopped", restart: "restarted", install_run: "install started" };
+  status((starting[action] || "") + it.name + "…");
   const r = await api("/api/items/" + encodeURIComponent(it.id) + "/" + action, "POST", {});
   if (!r.ok) status(r.data.detail || r.data.error || ("Couldn't " + action + " " + it.name + "."), "err");
-  else status(it.name + " " + ({ start: "started", stop: "stopped", restart: "restarted" }[action]) + ".", "ok");
+  else status(it.name + " " + (done[action] || action) + ".", "ok");
   setTimeout(refresh, 400);
 }
 
@@ -239,7 +246,7 @@ async function stopPort(g) {
 function primary(r) {
   if (!r) return;
   if (r.kind === "run") return r.it.url ? openUrl(r.it.url) : status(r.it.name + " has no web page.");
-  if (r.kind === "proj") return itemAction(r.it, "start");
+  if (r.kind === "proj") return itemAction(r.it, startAction(r.it));
   if (r.kind === "port") {
     if (r.g.ports.length > 1) { Q.open[r.g.key] = !Q.open[r.g.key]; return render(); }
     return r.g.ports[0].url ? openUrl(r.g.ports[0].url) : status("Port :" + r.g.ports[0].port + " isn't a web page.");
@@ -261,7 +268,8 @@ function act(name, idx, el) {
   if (!r) return;
   select(idx);
   if (name === "open") return primary(r.kind === "port" ? { kind: "port", g: Object.assign({}, r.g, { ports: [r.g.ports[0]] }) } : r);
-  if (name === "start" || name === "restart") return itemAction(r.it, name);
+  if (name === "start") return itemAction(r.it, startAction(r.it));
+  if (name === "restart") return itemAction(r.it, name);
   if (name === "stop") return stopRow(r);
   if (name === "toggle") { Q.open[r.g.key] = !Q.open[r.g.key]; return render(); }
   if (name === "openport") { const p = r.g.ports.find((x) => String(x.port) === el.dataset.port); if (p && p.url) openUrl(p.url); }
