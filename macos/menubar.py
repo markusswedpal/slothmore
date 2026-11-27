@@ -23,7 +23,7 @@ import time
 import traceback
 import urllib.request
 
-VERSION = "0.2.2"  # keep in sync with server.__version__ (a test checks it)
+VERSION = "0.2.3"  # keep in sync with server.__version__ (a test checks it)
 
 DEFAULT_URL = os.environ.get("SLOTHMORE_URL") or os.environ.get("LAUNCHER_URL") or "http://127.0.0.1:7777"
 MAX_STOPPED = 20  # stopped items listed under "Start"
