@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
@@ -426,7 +426,7 @@ TOOL_HINTS = {
     "uv": "Install uv: `brew install uv`.",
     "poetry": "Install Poetry: `brew install poetry` or `pipx install poetry`.",
     "make": "Install the Xcode command line tools: `xcode-select --install`.",
-    "docker": "Install Docker Desktop (or OrbStack) and make sure it is running.",
+    "docker": "Install Docker Desktop, OrbStack or Colima, then start it.",
     "go": "Install Go: `brew install go`.",
     "cargo": "Install Rust: `brew install rustup && rustup-init`.",
     "deno": "Install Deno: `brew install deno`.",
@@ -441,8 +441,7 @@ SHELL_ENTRY = ("run.sh", "start.sh", "dev.sh")
 NODE_ENTRY = ("index.js", "server.js", "main.js")
 PY_MAIN_RE = re.compile(r"""^if\s+__name__\s*==\s*['"]__main__['"]\s*:""", re.M)
 MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.\-/]*)\s*:(?![=:])", re.M)
-COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
-COMPOSE_PORT_RE = re.compile(r"""^\s*-\s*["']?(?:[\d.]+:)?(\d{2,5}):\d{1,5}(?:/tcp)?["']?\s*$""", re.M)
+COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")  # docker compose's own order
 TOML_SECTION_RE = re.compile(r"^\s*\[([^\[\]]+)\]\s*$")
 TOML_KV_RE = re.compile(r"""^\s*["']?([A-Za-z0-9_.\-]+)["']?\s*=\s*["']([^"']+)["']""")
 
@@ -625,6 +624,394 @@ def _pkg_finish(info, path, choices, default, pm, prefs):
         info["choices"] = None
     return info
 
+# --------------------------------------------------------------------------- Docker Compose
+
+COMPOSE_CHOICE = "docker-compose"     # choice key for "docker compose up" offered next to another run command
+DEFAULT_CHOICE = "default"            # choice key for the detected command when it had no picker of its own
+DOCKER_DOWN_MSG = "Docker isn't running. Start Docker Desktop, OrbStack or Colima, then try again."
+DOCKER_MISSING_MSG = "Docker isn't installed or isn't on PATH. Install Docker Desktop, OrbStack or Colima, then start it."
+DOCKER_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "~/.orbstack/bin", "~/.docker/bin", "~/.rd/bin",
+               "/Applications/Docker.app/Contents/Resources/bin", "/Applications/OrbStack.app/Contents/MacOS/xbin")
+# Ports that are almost never a web page: a compose file that only publishes these gets no Open button.
+NON_HTTP_PORTS = {22, 25, 53, 110, 143, 465, 587, 993, 995, 1433, 1521, 2181, 3306, 5432, 5672, 6379, 9042, 9092,
+                  11211, 27017, 27018, 26257, 4222, 1883, 5433, 6380, 7687, 9000}
+WEB_SERVICE_HINT_RE = re.compile(r"web|app|front|ui|site|server|api|nginx|caddy|traefik|proxy|dashboard|admin", re.I)
+COMPOSE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?])([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+YAML_KEY_RE = re.compile(r"""^["']?([A-Za-z0-9_.\-]+)["']?\s*:(?:\s+(.*))?$""")
+DOCKER_STATUS = {"at": 0.0, "ok": None, "prefix": None, "dir": None, "exe": None}   # compose CLI lookup only
+DOCKER_STATUS_TTL = 300.0
+DOCKER_DOWN_RE = re.compile(r"Cannot connect to the Docker daemon|Is the docker daemon running|"
+                            r"error during connect|docker\.sock: connect: (?:no such file|connection refused)", re.I)
+DOCKER_LOCK = threading.Lock()
+
+
+def compose_file(folder):
+    folder = Path(folder)
+    return next((folder / n for n in COMPOSE_FILES if (folder / n).is_file()), None)
+
+
+def docker_exe():
+    """The docker CLI: PATH first, then the places Docker Desktop, OrbStack, Homebrew and Rancher put it
+    (a login item's PATH can be shorter than the Terminal's)."""
+    found = which("docker")
+    if found:
+        return found
+    for d in DOCKER_DIRS:
+        c = os.path.join(os.path.expanduser(d), "docker")
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _dotenv(folder):
+    """KEY=VALUE pairs from the project's .env (compose reads it for ${VAR} in the compose file)."""
+    out = {}
+    for line in _read_text(Path(folder) / ".env", 100000).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[7:].strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        if ENV_KEY_RE.match(k):
+            out[k] = v
+    return out
+
+
+def _interpolate(value, env):
+    """${VAR}, ${VAR:-default}, ${VAR-default} and $VAR like compose does. None if a variable can't be resolved."""
+    bad = []
+
+    def sub(m):
+        name = m.group(1) or m.group(4)
+        op, default = m.group(2), m.group(3)
+        val = env.get(name)
+        if op in (":-", "-"):
+            if val is None or (op == ":-" and val == ""):
+                return default or ""
+            return val
+        if val is None:
+            bad.append(name)
+            return ""
+        return val
+
+    out = COMPOSE_VAR_RE.sub(sub, value.replace("$$", "\0"))
+    return None if bad else out.replace("\0", "$")
+
+
+def _unquote(v):
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def _strip_comment(line):
+    """Drop a YAML # comment that isn't inside quotes."""
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _first_port(v):
+    """'8080' -> 8080, '8000-8005' -> 8000; None if not a port."""
+    v = (v or "").strip().split("-")[0]
+    if not v.isdigit():
+        return None
+    n = int(v)
+    return n if 1 <= n <= 65535 else None
+
+
+def parse_port_spec(spec, env=None):
+    """One short-syntax `ports:` entry -> (published, target, protocol) or None.
+    '8080:80', '127.0.0.1:8080:80', '[::1]:8080:80', '8000-8001:8000-8001', '${WEB_PORT:-8080}:80', '53:53/udp'.
+    A bare '80' publishes on a random host port, so there's no fixed port to show: None."""
+    spec = _interpolate(_unquote(str(spec)), env or {})
+    if not spec:
+        return None
+    spec, _, proto = spec.partition("/")
+    proto = (proto or "tcp").lower()
+    if spec.startswith("["):              # IPv6 host address
+        end = spec.find("]")
+        if end == -1:
+            return None
+        spec = spec[end + 1:].lstrip(":")
+        parts = spec.split(":")
+        if len(parts) == 2:
+            parts = ["", parts[0], parts[1]]
+    else:
+        parts = spec.split(":")
+    if len(parts) == 2:
+        host, target = parts
+    elif len(parts) == 3:
+        host, target = parts[1], parts[2]
+    else:
+        return None
+    published, tgt = _first_port(host), _first_port(target)
+    if not published:
+        return None
+    return published, tgt, proto
+
+
+def parse_compose(text, env=None):
+    """Best-effort read of a compose file without a YAML library: service names and published ports.
+    Handles block and flow (`[...]`) port lists, short and long syntax, quotes, comments and ${VAR:-default}.
+    Returns {"services": [names], "ports": [{"service", "port", "target", "protocol"}]}."""
+    env = env or {}
+    services, ports = [], []
+    in_services = False
+    svc_indent = None
+    service = None
+    field_indent = None
+    in_ports = False
+    ports_indent = None
+    long_entry = None
+    long_indent = None
+
+    def add(service, spec):
+        if spec is None:
+            return
+        published, target, proto = spec
+        if proto != "tcp":
+            return
+        if any(p["port"] == published for p in ports):
+            return
+        ports.append({"service": service, "port": published, "target": target, "protocol": proto})
+
+    def flush_long():
+        if long_entry is None:
+            return
+        pub = _interpolate(_unquote(str(long_entry.get("published", ""))), env)
+        published = _first_port(pub) if pub else None
+        proto = (long_entry.get("protocol") or "tcp").lower()
+        if published:
+            add(service, (published, _first_port(_unquote(str(long_entry.get("target", "")))), _unquote(proto)))
+
+    for raw in (text or "").splitlines():
+        if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+            raw = raw.replace("\t", "  ")
+        line = _strip_comment(raw)
+        if not line.strip() or line.strip() in ("---", "..."):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        st = line.strip()
+        if indent == 0:
+            if in_ports:
+                flush_long()
+                long_entry = None
+            in_ports = False
+            in_services = st.split(":")[0].strip("\"'") == "services" and st.rstrip().endswith(":")
+            svc_indent, service, field_indent = None, None, None
+            continue
+        if not in_services:
+            continue
+        if in_ports:
+            if indent > ports_indent or (indent == ports_indent and st.startswith("-")):
+                if st.startswith("-"):
+                    flush_long()
+                    long_entry, long_indent = None, None
+                    val = st[1:].strip()
+                    m = YAML_KEY_RE.match(val)
+                    if m and not re.match(r"^[\d.\[\]$]", val):     # long syntax: "- target: 80"
+                        long_entry = {m.group(1): _unquote(m.group(2) or "")}
+                        long_indent = indent + 2
+                    else:
+                        add(service, parse_port_spec(val, env))
+                    continue
+                if long_entry is not None:
+                    m = YAML_KEY_RE.match(st)
+                    if m:
+                        long_entry[m.group(1)] = _unquote(m.group(2) or "")
+                continue
+            flush_long()
+            long_entry = None
+            in_ports = False
+        if svc_indent is None or indent <= svc_indent:
+            m = YAML_KEY_RE.match(st)
+            if m and not (m.group(2) or "").strip():
+                svc_indent = indent
+                service = m.group(1)
+                field_indent = None
+                if service not in services:
+                    services.append(service)
+            continue
+        if service is None:
+            continue
+        if field_indent is None:
+            field_indent = indent
+        if indent != field_indent:
+            continue
+        m = YAML_KEY_RE.match(st)
+        if not m or m.group(1) != "ports":
+            continue
+        rest = (m.group(2) or "").strip()
+        if rest.startswith("["):              # ports: ["8080:80", "443:443"]
+            for item in rest.strip("[]").split(","):
+                if item.strip():
+                    add(service, parse_port_spec(item, env))
+            continue
+        in_ports = True
+        ports_indent = indent
+        long_entry = None
+    if in_ports:
+        flush_long()
+    return {"services": services, "ports": ports}
+
+
+def _primary_compose_port(ports):
+    """The port the Open button uses: a web-looking service first, then the first port that isn't a database etc."""
+    web = [p for p in ports if p["port"] not in NON_HTTP_PORTS and (p.get("target") or 0) not in NON_HTTP_PORTS]
+    for p in web:
+        if WEB_SERVICE_HINT_RE.search(p.get("service") or ""):
+            return p["port"]
+    return web[0]["port"] if web else None
+
+
+def _compose_info(path, cf):
+    """Run fields for a compose project. docker compose finds the file (and compose.override.yaml) itself."""
+    env = dict(os.environ)
+    env.update(_dotenv(path))
+    try:
+        parsed = parse_compose(_read_text(cf), env)
+    except Exception:
+        LOG.debug("compose parse failed for %s", cf, exc_info=True)
+        parsed = {"services": [], "ports": []}
+    port = _primary_compose_port(parsed["ports"])
+    argv = ["docker", "compose", "up", "--remove-orphans"]
+    return {
+        "kind": "Compose", "cmd": "docker compose up", "argv": argv, "display_cmd": "docker compose up",
+        "detected": True, "lang": "", "web": bool(port), "port": port, "stop_signal": "INT", "static": False,
+        "html_files": [], "html_file": None, "install": None, "deps_missing": False, "needs_choice": False,
+        "compose": {"file": cf.name, "services": parsed["services"][:40], "ports": parsed["ports"][:40]},
+    }
+
+
+def _require_docker(info):
+    if docker_exe() or which("docker-compose"):
+        return info
+    info["missing_tool"] = "docker"
+    info["error"] = DOCKER_MISSING_MSG
+    return info
+
+
+def _offer_compose(info, path, prefs):
+    """A folder with a compose file *and* a clear dev command keeps that command as the default and gets
+    "docker compose up" as a second choice in the card's picker. Choosing it switches the card to Compose."""
+    if info.get("kind") == "Compose" or info.get("override") or Path(path).is_file():
+        return info
+    cf = compose_file(path)
+    if not cf:
+        return info
+    if not (info.get("cmd") or info.get("static") or info.get("choices")):
+        return info
+    comp = {"key": COMPOSE_CHOICE, "label": "docker compose up  ·  Docker Compose"}
+    if info.get("choices"):
+        base = list(info["choices"])
+    else:
+        key = info.get("choice") or DEFAULT_CHOICE
+        base = [{"key": key, "label": info.get("display_cmd") or info.get("cmd") or "python -m http.server"}]
+        info["choice"] = key
+    info["choices"] = base + [comp]
+    info["choice_label"] = info.get("choice_label") or "Run"
+    if (prefs or {}).get("choice") == COMPOSE_CHOICE:
+        info.update(_compose_info(path, cf))
+        info.update(choice=COMPOSE_CHOICE, missing_tool=None, error=None, pm=None, ai=None, note=None)
+        _require_docker(info)
+    return info
+
+
+def docker_check(force=False):
+    """Before a compose start: is the docker CLI there, does it have compose, and is the daemon up?
+    Returns (argv prefix for compose, docker dir) or raises ApiError with a message a person can act on.
+    The daemon is asked on every start (`docker info`, well under a second); only the compose plugin lookup is cached."""
+    exe = docker_exe()
+    legacy = which("docker-compose")
+    if not exe and not legacy:
+        raise ApiError(400, DOCKER_MISSING_MSG, missing_tool="docker")
+    env = os.environ.copy()
+    ddir = os.path.dirname(exe or legacy)
+    env["PATH"] = ddir + os.pathsep + env.get("PATH", "")
+    if exe:
+        try:
+            r = subprocess.run([exe, "info", "--format", "{{.ServerVersion}}"], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=10, env=env)
+        except subprocess.TimeoutExpired:
+            raise ApiError(503, "Docker isn't responding. Check Docker Desktop, OrbStack or Colima, then try again.",
+                           docker_down=True)
+        except OSError as e:
+            raise ApiError(400, "Couldn't run docker: %s" % e, missing_tool="docker")
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            LOG.info("docker info failed (%s): %s", r.returncode, _redact(err[:300]))
+            if re.search(r"permission denied", err, re.I):
+                raise ApiError(503, "Docker is running but this user can't reach it: %s" % err.splitlines()[-1][:200],
+                               docker_down=True)
+            raise ApiError(503, DOCKER_DOWN_MSG, docker_down=True)
+        with DOCKER_LOCK:
+            if (not force and DOCKER_STATUS["ok"] and DOCKER_STATUS["exe"] == exe
+                    and time.time() - DOCKER_STATUS["at"] < DOCKER_STATUS_TTL):
+                return DOCKER_STATUS["prefix"], DOCKER_STATUS["dir"]
+        prefix = [exe, "compose"]
+        try:
+            v = subprocess.run([exe, "compose", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               stdin=subprocess.DEVNULL, timeout=10, env=env)
+            has_plugin = v.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            has_plugin = False
+        if not has_plugin:
+            if not legacy:
+                raise ApiError(400, "Docker is running, but the compose plugin is missing. "
+                                    "Install it with `brew install docker-compose` (or update Docker Desktop).",
+                               missing_tool="docker compose")
+            prefix = [legacy]
+    else:
+        prefix = [legacy]      # standalone docker-compose without the docker CLI: it reports a stopped daemon itself
+    with DOCKER_LOCK:
+        DOCKER_STATUS.update(at=time.time(), ok=True, prefix=prefix, dir=ddir, exe=exe)
+    return prefix, ddir
+
+
+def compose_argv(it, prefix, action="up"):
+    """Swap the detected `docker compose` for the resolved CLI (absolute path, or docker-compose)."""
+    argv = list(it.get("argv") or ["docker", "compose", "up", "--remove-orphans"])
+    rest = argv[2:] if argv[:2] == ["docker", "compose"] else argv[1:]
+    if action == "down":
+        rest = ["down", "--remove-orphans"]
+    return list(prefix) + rest
+
+
+def _compose_down(run):
+    """After Stop: `docker compose down` so the containers and network don't stay behind (volumes are kept)."""
+    spec = getattr(run, "compose_down", None)
+    if not spec:
+        return
+    argv, cwd, env = spec
+    run.append("\n[stopping containers: %s]\n" % " ".join(["docker", "compose"] + argv[-2:]))
+    try:
+        r = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=120)
+        out = ANSI_RE.sub("", (r.stdout or b"").decode("utf-8", "replace"))
+        if out:
+            run.append(out if out.endswith("\n") else out + "\n")
+        if r.returncode != 0:
+            run.append("[docker compose down exited with code %s]\n" % r.returncode)
+    except subprocess.TimeoutExpired:
+        run.append("[docker compose down took longer than 2 minutes; check Docker for leftover containers]\n")
+    except OSError as e:
+        run.append("[could not run docker compose down: %s]\n" % e)
+
+
 
 def detect(path, prefs=None):
     """Work out how to run a folder (or a single script file). slothmore.json / launcher.json always wins,
@@ -643,6 +1030,10 @@ def detect(path, prefs=None):
             _ai_annotate(info, p, sig, prefs)
         except Exception:
             LOG.debug("AI annotation failed for %s", p, exc_info=True)
+    try:
+        _offer_compose(info, p, prefs)
+    except Exception:
+        LOG.debug("compose choice failed for %s", p, exc_info=True)
     return info
 
 
@@ -736,6 +1127,7 @@ def _detect_base(path, prefs=None, sig=None):
             port=override.get("port"),
             env={str(k): str(v) for k, v in (override.get("env") or {}).items()},
             detected=True,
+            override=True,
         )
         info["lang"] = lang_of(info["kind"], info["cmd"])
         return info
@@ -879,15 +1271,12 @@ def _detect_base(path, prefs=None, sig=None):
                     display_cmd="bundle exec rackup", detected=True, lang="")
         return _require_tool(info, "bundle")
 
-    # 9. docker compose
-    compose = next((path / n for n in COMPOSE_FILES if (path / n).is_file()), None)
+    # 9. docker compose: wins over everything below (shell scripts, entry files, static pages, pickers).
+    #    Folders that also matched 2-8 get it as a second choice (see _offer_compose).
+    compose = compose_file(path)
     if compose:
-        m = COMPOSE_PORT_RE.search(_read_text(compose))
-        port = int(m.group(1)) if m else None
-        info.update(kind="Compose", cmd="docker compose up", argv=["docker", "compose", "-f", compose.name, "up"],
-                    display_cmd="docker compose up", detected=True, lang="", web=bool(port), port=port,
-                    stop_signal="INT")
-        return _require_tool(info, "docker")
+        info.update(_compose_info(path, compose))
+        return _require_docker(info)
 
     # 10. shell entry scripts
     for f in SHELL_ENTRY:
@@ -1896,6 +2285,7 @@ def public(it, cfg=None):
         "last_run": _last_run_summary(it["id"]),
         "readme": (lambda m: {"name": m["name"], "size": m["size"]} if m else None)(readme_meta(it["path"])),
         "ai": it.get("ai"),
+        "compose": it.get("compose"),
         "note": it.get("note"),
         "agents": AGENTS_BY_ITEM.get(it["id"]) or [],
     }
@@ -1988,6 +2378,7 @@ class Run:
         self.stop_signal = None
         self.token_url = bool(item.get("token_url"))
         self.open_url = None
+        self.compose_down = None      # (argv, cwd, env) for `docker compose down` after Stop
 
     def append(self, text):
         with self.cond:
@@ -2150,6 +2541,10 @@ def _reader(run):
         os.close(run.master)
     except OSError:
         pass
+    if run.compose_down and run.stopping and not run.restarting:
+        _compose_down(run)
+    elif run.compose_down and code != 0 and DOCKER_DOWN_RE.search(run.port_tail + "".join(run.chunks[-20:])):
+        run.append("\n[%s]\n" % DOCKER_DOWN_MSG)
     run.finish(code)
     if not run.stopping and not run.restarting:
         dur = _fmt_duration(time.time() - run.started_at)
@@ -2331,7 +2726,7 @@ def _launch_install(it, trigger="install"):
     pseudo = dict(it)
     pseudo.update(argv=list(inst["argv"]), cmd=inst["display"], display_cmd=inst["display"], web=False,
                   static=False, port=None, cwd=inst.get("cwd") or it["cwd"], missing_tool=None,
-                  needs_choice=False, stop_signal=None)
+                  needs_choice=False, stop_signal=None, compose=None)
     run = start_run(pseudo, {"args": None}, trigger=trigger, check_port=False, no_args=True)
     run.cancel_auto_restart = True
     run.watch_snapshot = None
@@ -2403,11 +2798,13 @@ def install_and_run(it, body=None):
     The start happens in a background thread so it still runs if the browser closes.
     Saved args, the chosen script, and the usual port check are used on start, the same as Start.
     """
-    _install_precheck(it)
     iid = it["id"]
     with INSTALL_RUN_LOCK:
+        # pending first: a second click that lands while the first install is running gets this message,
+        # not the precheck's "Stop it first" (that race made test_duplicate_click_rejected flaky)
         if iid in INSTALL_RUN_PENDING:
             raise ApiError(409, "Install and run is already in progress.")
+        _install_precheck(it)
         cur = RUNS.get(iid)
         if cur and cur.alive:
             raise ApiError(409, "Stop it first, then install.")
@@ -2435,6 +2832,9 @@ def start_run(it, body=None, carry_chunks=None, banner=None, trigger="manual", c
     if not (it["cmd"] or it["static"]):
         raise ApiError(400, it["error"] or "No run command found. Add a slothmore.json (or launcher.json).")
     body = body or {}
+    compose_prefix = docker_dir = None
+    if it.get("compose"):
+        compose_prefix, docker_dir = docker_check()
     cfg = load_config()
     saved_prefs = (cfg.get("prefs") or {}).get(it["id"]) or {}
     if no_args:
@@ -2530,7 +2930,15 @@ def start_run(it, body=None, carry_chunks=None, banner=None, trigger="manual", c
                 run.assigned_port = port
                 if it["port"]:
                     run.port = int(it["port"])
-            if it.get("argv"):
+            if it.get("compose"):
+                # Published ports come from the compose file; container logs print in-container ports, so don't
+                # let them replace the port the Open button uses.
+                run.local_locked = True
+                env["PATH"] = docker_dir + os.pathsep + env.get("PATH", "")
+                env.update(COMPOSE_MENU="false", COMPOSE_PROGRESS="plain", COMPOSE_ANSI="never")
+                argv = compose_argv(it, compose_prefix) + extra_argv
+                run.compose_down = (compose_argv(it, compose_prefix, "down"), it["cwd"], dict(env))
+            elif it.get("argv"):
                 port_s = env.get("PORT") or str(it.get("port") or free_port())
                 argv = [a.replace("{PORT}", port_s) for a in it["argv"]] + extra_argv
                 for k, v in list(env.items()):
@@ -2583,11 +2991,11 @@ def restart_run(it, body=None, reason=None, carry_chunks=None):
                 old.restarting = True
                 old.stopping = True
                 try:
-                    os.killpg(old.proc.pid, signal.SIGTERM)
+                    os.killpg(old.proc.pid, signal.SIGINT if old.stop_signal == "INT" else signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
     if old and old.alive:
-        for _ in range(25):
+        for _ in range(150 if old.stop_signal == "INT" else 25):
             if not old.alive:
                 break
             time.sleep(0.1)
@@ -3134,14 +3542,23 @@ def port_owner(port):
 
 
 def _check_expected_port(it):
-    port = _expected_port(it)
-    if not port:
-        return
-    if any(r.alive and r.port == port for r in RUNS.values()):
-        return
-    if port_in_use(port):
-        owner = port_owner(port) or {}
-        raise ApiError(409, "port_in_use", port=port, pid=owner.get("pid"), command=owner.get("command"))
+    ports = [_expected_port(it)]
+    if it.get("compose"):
+        ports += [p["port"] for p in (it["compose"].get("ports") or [])]
+    seen = set()
+    for port in ports:
+        if not port or port in seen:
+            continue
+        seen.add(port)
+        if any(r.alive and r.port == port for r in RUNS.values()):
+            continue
+        if port_in_use(port):
+            owner = port_owner(port) or {}
+            extra = {}
+            if it.get("compose"):
+                extra["hint"] = ("Containers from an earlier run may still be up. Start anyway attaches to them, "
+                                 "or run `docker compose down` in the folder first.")
+            raise ApiError(409, "port_in_use", port=port, pid=owner.get("pid"), command=owner.get("command"), **extra)
 
 
 def _monitor_loop():
@@ -3345,9 +3762,11 @@ def stop_all_mine():
 
 
 def stop_all():
-    for run in list(RUNS.values()):
+    runs = list(RUNS.values())
+    compose = any(r.alive and r.compose_down for r in runs)
+    for run in runs:
         stop_run(run)
-    for _ in range(40):
+    for _ in range(300 if compose else 40):
         if not any(r.alive for r in RUNS.values()):
             break
         time.sleep(0.1)

@@ -115,7 +115,7 @@ macos/install-login-item.sh uninstall                           # remove both (s
 
 If your folders are inside Desktop, Documents or Downloads, macOS may ask once whether `python3` may access them. Click Allow. A folder like `~/Projects` avoids the prompt.
 
-**Tested on Linux only.** The installer was checked with a dry run (`SLOTHMORE_DRY_RUN=1 LAUNCH_AGENTS_DIR=/tmp/x …` writes the plists and prints the `launchctl` commands without running them), and the menu bar helper was tested against a stand-in for rumps. Real `launchctl bootstrap`, the rumps menu itself, the quick panel window (NSPanel + WKWebView; its `/compact` page and the panel's sizing and message logic are tested on Linux), and macOS notifications (`osascript`) have not been run on a Mac yet. If something fails, `macos/install-login-item.sh status` and the two log files above are the first places to look.
+**Tested on Linux only.** The installer was checked with a dry run (`SLOTHMORE_DRY_RUN=1 LAUNCH_AGENTS_DIR=/tmp/x …` writes the plists and prints the `launchctl` commands without running them), and the menu bar helper was tested against a stand-in for rumps. Real `launchctl bootstrap`, the rumps menu itself, the quick panel window (NSPanel + WKWebView; its `/compact` page and the panel's sizing and message logic are tested on Linux), macOS notifications (`osascript`), and Docker Compose against a real Docker (tested with a stand-in `docker` script) have not been run on a Mac yet. If something fails, `macos/install-login-item.sh status` and the two log files above are the first places to look.
 
 ## How it decides what to run
 
@@ -132,7 +132,7 @@ For each folder, the first match wins:
 | 6 | `deno.json(c)` with tasks | `deno task dev`/`start`/`serve`, picker for the rest | Deno |
 | 7 | `go.mod` / `Cargo.toml` | `go run .` / `cargo run` | Go / Rust |
 | 8 | `bin/rails` / `config.ru` | `bin/rails server -p $PORT` / `bundle exec rackup -p $PORT` | Rails / Ruby web |
-| 9 | `compose.yaml`, `docker-compose.yml` … | `docker compose up` (Stop sends Ctrl+C first so containers shut down cleanly, then waits up to 15 s) | Compose |
+| 9 | `compose.yaml`, `compose.yml`, `docker-compose.yaml` or `docker-compose.yml` | `docker compose up --remove-orphans`, see [Docker Compose](#docker-compose) | Compose |
 | 10 | `run.sh`, `start.sh` or `dev.sh` | `bash <file>` | Script |
 | 11 | `package.json` `main`, or `index.js`/`server.js`/`main.js` | `node <file>` | Node |
 | 12 | `index.html` (or static `*.html` files) | `python -m http.server <free port>` (page picker if several) | HTML |
@@ -147,6 +147,18 @@ For each folder, the first match wins:
 - **Install / Install and run:** when `node_modules` is missing (for a monorepo package it checks the package and the workspace root), or a Python project has `requirements.txt`/`pyproject.toml` but no `.venv`, the card shows *Dependencies not installed* with **Install** and **Install and run**. Both run `<pm> install`, `uv sync`, `poetry install` or `python -m venv .venv && .venv/bin/pip install -r requirements.txt` (or `-e .`). Output goes to the terminal panel and to the run history like a normal run. **Install and run** then starts the project (saved args, chosen script, and the usual port check) only if the install exits 0; a failed install is left stopped. The chain runs on the server, so it still finishes if you close the browser. The menu bar quick panel's **Quick start** does the same when dependencies are missing.
 
 Web servers get a free port through the `PORT` environment variable, and the card shows the port it actually printed (for example Vite's 5173) with an **Open** button.
+
+### Docker Compose
+
+A folder with `compose.yaml`, `compose.yml`, `docker-compose.yaml` or `docker-compose.yml` is a **Compose** card (filter: **Docker**).
+
+- **Which command wins:** a clear dev command in the same folder (rules 2–8: a `package.json` `dev`/`start`/`serve`/`preview` script, a Makefile `dev`/`run`/`start`/`serve` target, `app.py`/`main.py`, pyproject entry points, Deno tasks, Go, Rust, Rails) stays the default, because there the compose file is usually just the database next to the app. **docker compose up** is then added as the last option in the card's picker; choose it and the card switches to Compose (choose the other entry to switch back). Compose wins over everything below rule 9 (shell scripts, entry files, static pages, loose `.py` files, script pickers, notebooks). A `slothmore.json` still overrides everything.
+- **Start** runs `docker compose up --remove-orphans` in the folder, attached, so the container logs stream into the output panel. `compose.override.yaml` and `.env` are picked up the same way as in Terminal. Args are added after `up` (for example `--build`, or service names to start only those).
+- **Stop** sends Ctrl+C, so compose stops the containers gracefully (up to 15 s, then SIGTERM), and then runs `docker compose down --remove-orphans` so the containers and network don't stay behind. Volumes are kept. The `down` output appears in the log before `[stopped]`. **Restart** only stops and starts again, without `down`. If `docker compose up` exits on its own, `down` is not run.
+- **Ports:** the card lists the services and the host ports the compose file publishes (`"8080:80"`, `127.0.0.1:8080:80`, ranges, `${PORT:-8080}:80` with values from `.env`, and the long `published:` form; UDP and random host ports are skipped). The **Open** button uses the first web-looking port (a service named web, app, frontend, api, nginx … first; database and cache ports like 5432, 3306, 6379, 27017 never). A compose file that only publishes database ports gets no Open button. Ports printed by the containers are not used, since they are the ports inside the container. Before Start, all published ports are checked; if one is taken (often by containers from an earlier run), you get the usual port warning with **Start anyway**.
+- **Docker missing or not running:** if there's no `docker` CLI (also looked for in `/usr/local/bin`, `/opt/homebrew/bin`, `~/.orbstack/bin`, `~/.docker/bin`, `~/.rd/bin` and inside Docker.app), the card says *Docker isn't installed or isn't on PATH*. Start first asks the daemon (`docker info`); if it doesn't answer, you get *Docker isn't running. Start Docker Desktop, OrbStack or Colima, then try again.* instead of a failed run. Without the compose plugin, a standalone `docker-compose` is used if there is one. If Docker stops while a project is running, the log ends with the same hint.
+- **Install and run** doesn't apply: Compose cards never show *Dependencies not installed*.
+- Compose runs with `COMPOSE_MENU=false`, `COMPOSE_PROGRESS=plain` and `COMPOSE_ANSI=never`, so the log stays readable and compose's interactive key menu doesn't appear.
 
 ### Subfolders, monorepos and loose files
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.5 (2026-11-27)
+
+### Added
+- **Docker Compose projects.** A folder with `compose.yaml`, `compose.yml`, `docker-compose.yaml` or `docker-compose.yml` gets a **Compose** card. **Start** runs `docker compose up --remove-orphans` attached, so container logs stream into the output panel. **Stop** sends Ctrl+C so the containers stop gracefully, then runs `docker compose down --remove-orphans` so nothing keeps running (volumes are kept). **Restart** stops and starts without `down`.
+- **Ports from the compose file.** The card lists the services and their published host ports (short and long syntax, `127.0.0.1:` and IPv6 bindings, ranges, `${VAR:-default}` with `.env`). **Open** uses the first web-looking port and skips database and cache ports; links for every published port show while it runs. All published ports are checked before Start.
+- **Compose as a second choice.** When a folder has a compose file and a clear dev command (for example `npm run dev`, `make dev`, `python app.py`, `go run .`), that command stays the default and **docker compose up** is added to the card's picker. Compose now wins over the weaker fallbacks (shell scripts, entry files, static pages, loose `.py` files, script pickers).
+- **Docker filter** in the dashboard's type chips.
+
+### Changed
+- **Clear message when Docker isn't there.** Start checks the daemon first and shows "Docker isn't running. Start Docker Desktop, OrbStack or Colima, then try again." instead of a failed run. A missing `docker` CLI shows "Docker isn't installed or isn't on PATH" on the card; the CLI is also found in the usual Docker Desktop, OrbStack, Homebrew and Rancher Desktop folders when the login item's PATH is shorter. Without the compose plugin, a standalone `docker-compose` is used.
+- The compose file is no longer passed with `-f`, so `compose.override.yaml` is merged the same way as in Terminal.
+- Compose runs with its interactive key menu and progress animations turned off, so the log stays readable.
+
+### Fixed
+- A second **Install and run** click that arrived while the first install was running could get "Stop it first, then install." instead of "Install and run is already in progress." (the flaky `test_duplicate_click_rejected`).
+
 ## 0.2.4 (2026-11-27)
 
 ### Added
