@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 (2026-11-27)
+
+### Added
+- **Install and run.** When a Node or Python project is missing its dependencies, the card still has **Install**, and now also **Install and run**. That runs the same install as **Install** (output in the terminal and in history), and only if it exits 0 starts the project the same way **Start** would, including saved args, the chosen script, and the usual port check. If the install fails, the project is left stopped. The work happens on the server, so it still finishes if you close the browser. A second click while it is already in progress is rejected; the first one keeps going. The menu bar quick panel's **Quick start** uses the same chain when dependencies are missing.
+
 ## 0.2.2 (2026-11-26)
 
 ### Fixed

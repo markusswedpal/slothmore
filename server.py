@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
@@ -1859,6 +1859,7 @@ def public(it, cfg=None):
         "deps_missing": bool(it.get("deps_missing")),
         "install_cmd": (it.get("install") or {}).get("display"),
         "install_missing_tool": (lambda t: t if t and not which(t) else None)((it.get("install") or {}).get("tool")),
+        "install_run_pending": it["id"] in INSTALL_RUN_PENDING,
         "pm": it.get("pm"),
         "kind": it["kind"],
         "web": is_web,
@@ -1908,6 +1909,8 @@ RUNS_LOCK = threading.Lock()
 RUN_SEQ = 0
 CRASH_HISTORY = {}
 RESTART_COUNTS = {}
+INSTALL_RUN_PENDING = set()
+INSTALL_RUN_LOCK = threading.Lock()
 
 
 def _detect_port(tail):
@@ -2310,9 +2313,7 @@ def update_prefs(it, body):
         save_config(cfg)
 
 
-def install_item(it):
-    """Run the detected dependency install (npm/pnpm/yarn/bun install, uv sync, poetry install, venv + pip)
-    as a normal run of this item, so its output shows in the terminal and in history."""
+def _install_precheck(it):
     inst = it.get("install")
     if not inst:
         raise ApiError(400, "Nothing to install for this item.")
@@ -2322,14 +2323,107 @@ def install_item(it):
     cur = RUNS.get(it["id"])
     if cur and cur.alive:
         raise ApiError(409, "Stop it first, then install.")
+    return inst
+
+
+def _launch_install(it, trigger="install"):
+    inst = it["install"]
     pseudo = dict(it)
     pseudo.update(argv=list(inst["argv"]), cmd=inst["display"], display_cmd=inst["display"], web=False,
                   static=False, port=None, cwd=inst.get("cwd") or it["cwd"], missing_tool=None,
                   needs_choice=False, stop_signal=None)
-    run = start_run(pseudo, {"args": None}, trigger="install", check_port=False, no_args=True)
+    run = start_run(pseudo, {"args": None}, trigger=trigger, check_port=False, no_args=True)
     run.cancel_auto_restart = True
     run.watch_snapshot = None
     return run
+
+
+def install_item(it):
+    """Run the detected dependency install (npm/pnpm/yarn/bun install, uv sync, poetry install, venv + pip)
+    as a normal run of this item, so its output shows in the terminal and in history."""
+    _install_precheck(it)
+    with INSTALL_RUN_LOCK:
+        if it["id"] in INSTALL_RUN_PENDING:
+            raise ApiError(409, "Install and run is already in progress.")
+    return _launch_install(it)
+
+
+def _wait_run(run):
+    """Block until a run has finished and return its exit code."""
+    with run.cond:
+        while run.alive:
+            run.cond.wait(timeout=0.5)
+    return run.exit_code
+
+
+def _finish_install_run(iid, body, install_run):
+    """After an install started by Install and run exits 0, start the project. Runs in a background thread."""
+    try:
+        code = _wait_run(install_run)
+        if code != 0:
+            try:
+                install_run.append("\n[install failed; not starting]\n")
+            except Exception:
+                pass
+            return
+        invalidate_scan()
+        it = find_item(iid)
+        if not it:
+            try:
+                install_run.append("\n[install finished, but the project is no longer in the list]\n")
+            except Exception:
+                pass
+            return
+        try:
+            start_run(
+                it, body=body or {},
+                carry_chunks=list(install_run.chunks),
+                banner="\n--- [starting after install] ---\n",
+                trigger="install-run",
+            )
+        except ApiError as e:
+            try:
+                install_run.append("\n[could not start: %s]\n" % e.payload.get("error", str(e)))
+            except Exception:
+                pass
+        except Exception:
+            LOG.exception("install-and-run failed to start %s", iid)
+            try:
+                install_run.append("\n[could not start after install]\n")
+            except Exception:
+                pass
+    finally:
+        with INSTALL_RUN_LOCK:
+            INSTALL_RUN_PENDING.discard(iid)
+
+
+def install_and_run(it, body=None):
+    """Install dependencies, then start the project if the install exits 0.
+
+    The start happens in a background thread so it still runs if the browser closes.
+    Saved args, the chosen script, and the usual port check are used on start, the same as Start.
+    """
+    _install_precheck(it)
+    iid = it["id"]
+    with INSTALL_RUN_LOCK:
+        if iid in INSTALL_RUN_PENDING:
+            raise ApiError(409, "Install and run is already in progress.")
+        cur = RUNS.get(iid)
+        if cur and cur.alive:
+            raise ApiError(409, "Stop it first, then install.")
+        INSTALL_RUN_PENDING.add(iid)
+    try:
+        run = _launch_install(it, trigger="install-run")
+        threading.Thread(
+            target=_finish_install_run, args=(iid, dict(body or {}), run),
+            name="install-run-%s" % iid, daemon=True,
+        ).start()
+        return run
+    except Exception:
+        with INSTALL_RUN_LOCK:
+            INSTALL_RUN_PENDING.discard(iid)
+        raise
+
 
 
 def start_run(it, body=None, carry_chunks=None, banner=None, trigger="manual", check_port=True, no_args=False):
@@ -4619,6 +4713,8 @@ class Handler(BaseHTTPRequestHandler):
             clear_history(iid)
         elif action == "install":
             install_item(it)
+        elif action == "install_run":
+            install_and_run(it, body)
         elif action == "readme-open":
             self._send(200, open_readme(it, body.get("mode", "reveal")))
             return
