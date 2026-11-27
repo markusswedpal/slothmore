@@ -373,6 +373,9 @@ dialog .line input{
 .health b{color:var(--ink);font-weight:500}
 .lastrun{font-family:var(--info);font-size:12px;color:var(--muted)}
 .lastrun.bad{color:var(--danger)}
+.compose-meta{font-family:var(--info);font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.compose-meta a{color:var(--accent);text-decoration:none}
+.compose-meta a:hover{text-decoration:underline}
 .pill-btn.auto{border-style:dashed}
 .pill-btn.muted{opacity:.55}
 .grp{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--border);border-radius:9px;background:rgba(16,22,31,.55)}

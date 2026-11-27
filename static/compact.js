@@ -156,12 +156,13 @@ function rowHtml(r, idx) {
   const sel = idx === Q.sel ? " sel" : "";
   const a = (act, label, cls, title) => '<button type="button" class="qb ' + (cls || "") + '" data-act="' + act + '" data-i="' + idx + '"' + (title ? ' title="' + esc(title) + '"' : "") + ">" + label + "</button>";
   if (r.kind === "run") {
-    const i = r.it, sub = [i.url ? host(i.url) : (i.port ? ":" + i.port : ""), i.started_at ? "up " + ago(i.started_at).replace(" ago", "") : "", i.prompt ? "waiting for input" : ""].filter(Boolean).join(" · ");
+    const i = r.it, sub = [i.compose ? "Docker" : "", i.url ? host(i.url) : (i.port ? ":" + i.port : ""), i.started_at ? "up " + ago(i.started_at).replace(" ago", "") : "", i.prompt ? "waiting for input" : ""].filter(Boolean).join(" · ");
     return '<div class="row' + sel + '" role="option" data-i="' + idx + '"><span class="dot on"></span><span class="r-main"><span class="r-name">' + esc(i.name) + '</span><span class="r-sub">' + esc(sub || i.run_cmd || "") + '</span></span><span class="r-acts">' +
       (i.url ? a("open", ICON_OPEN, "", "Open " + i.url) : "") + a("restart", "↻", "", "Restart") + a("stop", "Stop", "danger") + "</span></div>";
   }
   if (r.kind === "proj") {
-    const i = r.it, sub = [i.source === "pinned" ? "pinned" : "", i.last_run ? "ran " + ago(i.last_run.started) : "", i.run_cmd || i.cmd || ""].filter(Boolean).join(" · ");
+    const i = r.it, sub = [i.source === "pinned" ? "pinned" : "", i.last_run ? "ran " + ago(i.last_run.started) : "", i.run_cmd || i.cmd || "",
+      i.compose && i.compose.ports && i.compose.ports.length ? i.compose.ports.slice(0, 3).map((p) => ":" + p.port).join(" ") : ""].filter(Boolean).join(" · ");
     const startLbl = (i.deps_missing && i.install_cmd && !i.install_missing_tool) ? "Install and run" : "Start";
     return '<div class="row' + sel + '" role="option" data-i="' + idx + '"><span class="dot"></span><span class="r-main"><span class="r-name">' + esc(i.name) + '</span><span class="r-sub">' + esc(sub) + '</span></span><span class="r-acts">' + a("start", startLbl, "primary") + "</span></div>";
   }

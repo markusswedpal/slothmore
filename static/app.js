@@ -193,7 +193,8 @@ function matchesKind(it) {
     case "web": return it.web;
     case "python": return it.lang === "python";
     case "node": return it.lang === "node";
-    case "scripts": return !it.web && it.startable;
+    case "scripts": return !it.web && !it.compose && it.startable;
+    case "docker": return it.kind === "Compose";
     case "ai": return !!it.ai || !!(it.agents && it.agents.length);
     default: return true;
   }
@@ -247,6 +248,22 @@ function titleHtml(it) {
     (sub ? '<div class="folder-sub" title="' + esc(it.rel || it.folder || "") + '">' + sub + "</div>" : "") + "</div>";
 }
 
+// Docker Compose card line: services and the host ports the compose file publishes (links while running).
+function composeMeta(it) {
+  const c = it.compose || {};
+  const svcs = c.services || [];
+  const ports = c.ports || [];
+  const parts = [];
+  if (svcs.length) parts.push(esc(svcs.length === 1 ? "1 service" : svcs.length + " services") + ": " + esc(svcs.slice(0, 4).join(", ") + (svcs.length > 4 ? " …" : "")));
+  if (ports.length) {
+    parts.push(ports.slice(0, 6).map((p) => {
+      const lbl = ":" + p.port + (p.service ? " " + p.service : "");
+      return it.running ? '<a href="http://localhost:' + Number(p.port) + '" target="_blank" rel="noopener">' + esc(lbl) + "</a>" : esc(lbl);
+    }).join(" · ") + (ports.length > 6 ? " …" : ""));
+  } else parts.push("no published ports");
+  return '<div class="compose-meta" title="' + esc(c.file || "compose file") + '">' + parts.join(" · ") + "</div>";
+}
+
 function cardHtml(it, draggable) {
   const st = statusOf(it);
   const dot = it.running ? '<span class="dot" aria-hidden="true"></span>' : '<span class="dot off" aria-hidden="true"></span>';
@@ -255,9 +272,9 @@ function cardHtml(it, draggable) {
   if (it.url) actions += '<a class="btn sm" href="' + esc(it.url) + '" target="_blank" rel="noopener">Open ' + OPEN + '</a>';
   if (it.running) {
     actions += '<button type="button" class="btn sm" data-act="restart" title="Restart">' + RESTART_ICO + ' Restart</button>';
-    actions += '<button type="button" class="btn sm" data-act="stop">' + STOP + ' Stop</button>';
+    actions += '<button type="button" class="btn sm" data-act="stop"' + (it.compose ? ' title="Stops the containers, then runs docker compose down"' : "") + '>' + STOP + ' Stop</button>';
   } else if (it.startable) {
-    actions += '<button type="button" class="btn primary" data-act="start">' + PLAY + ' ' + (it.web ? "Start" : "Run") + '</button>';
+    actions += '<button type="button" class="btn primary" data-act="start">' + PLAY + ' ' + (it.web || it.compose ? "Start" : "Run") + '</button>';
   }
 
   let cmd = "";
@@ -318,6 +335,7 @@ function cardHtml(it, draggable) {
         '<button type="button" class="btn xs" data-preset-del="' + esc(it.id) + '" title="Delete selected preset" aria-label="Delete preset"' + (matched ? "" : " disabled") + ">✕</button></div>";
     }
   }
+  if (it.compose) extra += composeMeta(it);
   if (it.url) {
     extra += '<div class="url-row"><a href="' + esc(it.url) + '" target="_blank" rel="noopener">' + esc(it.url) + "</a></div>";
   }
@@ -430,7 +448,7 @@ function render() {
   }).join("") : '<p class="form-note">Start a frontend and backend together.</p>';
 
   // chips
-  const kinds = [["all", "All"], ["web", "Web"], ["python", "Python"], ["node", "Node"], ["scripts", "Scripts"], ["ai", "AI"]];
+  const kinds = [["all", "All"], ["web", "Web"], ["python", "Python"], ["node", "Node"], ["scripts", "Scripts"], ["docker", "Docker"], ["ai", "AI"]];
   $("#chips").innerHTML = kinds.map((k) => '<button type="button" class="chip" data-kind="' + k[0] + '" aria-pressed="' + (S.kind === k[0]) + '">' + k[1] + "</button>").join("");
 
   // sections (preserve active input/select focus)
@@ -620,6 +638,7 @@ async function startItem(id, force) {
       const who = r.data.pid ? " by " + (r.data.command || "a process") + " (PID " + r.data.pid + ")" : "";
       notify("Port " + r.data.port + " is already in use" + who + ". " + (it ? it.name : "This item") +
         " usually listens there, so it may fail or pick another port. Nothing was stopped." +
+        (r.data.hint ? " " + r.data.hint : "") +
         (r.data.pid ? " To free it yourself: kill " + r.data.pid : ""),
         [{ label: "Start anyway", run: () => startItem(id, true) }]);
     } else notify(r.data.error || "Something went wrong.");
