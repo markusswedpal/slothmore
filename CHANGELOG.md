@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 (2026-11-27)
+
+### Added
+- **Empty quick panel.** On a fresh install, with no watched or pinned folders, the menu bar panel no longer shows only "Nothing running" and an empty Quick start. It shows a short "No folders yet" message (with the sloth mark) and three buttons: **Add folder to watch** (a folder whose subfolders are projects), **Add single project** (one folder = one project), and **Open full window**.
+- From the panel, the add buttons open a native macOS folder picker (NSOpenPanel). The panel stays open while you pick, then adds the folder through the same APIs as the full dashboard. In a browser tab at `/compact`, or if the picker isn't available, the buttons open the full window on its add-folder dialog (`/?add=watch` or `/?add=pin`).
+- **Open full window** is a clearer button in the panel footer (still ⌘O), not only a small "Full view" label.
+
 ## 0.2.3 (2026-11-27)
 
 ### Added

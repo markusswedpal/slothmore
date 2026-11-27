@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - depends on the machine
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 APP_NAME = "Slothmore"
 DEFAULT_PORT = 7777
 
